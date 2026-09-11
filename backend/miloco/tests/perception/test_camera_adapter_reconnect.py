@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+import numpy as np
 from miloco.perception.collect.camera_adapter import (
     CameraDeviceAdapter,
     _CameraDeviceState,
 )
+from miloco.perception.collect.camera_stream import DecodedVideoCallback
 from miloco.perception.types import PerceptionDevice
 
 
@@ -47,6 +49,90 @@ class TestConnectDeviceManagerMissing:
         asyncio.run(adapter.connect_device("cam1", source=_source()))
 
         assert "cam1" in adapter._devices
+
+
+class _RecordingVideoSource:
+    def __init__(
+        self,
+        registration_id: int = 41,
+        start_error: Exception | None = None,
+    ) -> None:
+        self.registration_id = registration_id
+        self.start_error = start_error
+        self.starts: list[tuple[str, int]] = []
+        self.stops: list[tuple[str, int, int]] = []
+        self.callback: DecodedVideoCallback | None = None
+
+    async def start(
+        self,
+        camera_id: str,
+        channel: int,
+        callback: DecodedVideoCallback,
+    ) -> int:
+        self.starts.append((camera_id, channel))
+        if self.start_error is not None:
+            raise self.start_error
+        self.callback = callback
+        return self.registration_id
+
+    async def stop(
+        self,
+        camera_id: str,
+        channel: int,
+        registration_id: int,
+    ) -> None:
+        self.stops.append((camera_id, channel, registration_id))
+
+
+class TestVideoStreamSourceLifecycle:
+    def _adapter(self, source: _RecordingVideoSource) -> CameraDeviceAdapter:
+        proxy = MagicMock()
+        proxy.start_camera_decode_audio_stream = AsyncMock(return_value=-1)
+        proxy.stop_camera_decode_audio_stream = AsyncMock()
+        proxy.get_cached_camera = MagicMock(return_value=None)
+        return CameraDeviceAdapter(miot_proxy=proxy, video_stream_source=source)
+
+    def test_connect_callback_duplicate_connect_and_disconnect(self):
+        source = _RecordingVideoSource()
+        adapter = self._adapter(source)
+
+        async def scenario() -> None:
+            await adapter.connect_device("cam1", source=_source())
+            await adapter.connect_device("cam1", source=_source())
+            assert source.callback is not None
+
+            frame = np.zeros((2, 3, 3), dtype=np.uint8)
+            await source.callback("cam1", frame, 1, 0, 0, 0)
+            assert adapter.peek_latest_frame("cam1") is frame
+
+            await adapter.disconnect_device("cam1")
+
+        asyncio.run(scenario())
+
+        assert source.starts == [("cam1", 0)]
+        assert source.stops == [("cam1", 0, 41)]
+        assert "cam1" not in adapter._devices
+
+    def test_camera_removal_stops_source(self, monkeypatch):
+        source = _RecordingVideoSource()
+        adapter = self._adapter(source)
+        asyncio.run(adapter.connect_device("cam1", source=_source()))
+        monkeypatch.setattr(adapter, "discover_devices", AsyncMock(return_value={}))
+
+        asyncio.run(adapter.sync_devices(all_devices={"other": _source("other")}))
+
+        assert source.stops == [("cam1", 0, 41)]
+        assert "cam1" not in adapter._devices
+
+    def test_start_exception_leaves_no_device_or_registration(self):
+        source = _RecordingVideoSource(start_error=RuntimeError("stream unavailable"))
+        adapter = self._adapter(source)
+
+        asyncio.run(adapter.connect_device("cam1", source=_source()))
+
+        assert source.starts == [("cam1", 0)]
+        assert source.stops == []
+        assert "cam1" not in adapter._devices
 
 
 class TestSyncDevicesOnDemandRefresh:

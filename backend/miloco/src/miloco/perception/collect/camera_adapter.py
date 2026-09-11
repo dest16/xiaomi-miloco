@@ -1,9 +1,9 @@
 """
 Camera device adapter — manages decoded video/audio frame streams from cameras.
 
-Subscribes to 2 decoded stream types per device via MiotProxy:
-  1. decoded_video — decoded PyAV VideoFrame
-  2. decoded_audio — decoded PyAV AudioFrame
+Subscribes to 2 decoded stream types per device:
+  1. decoded_video — supplied by CameraVideoStreamSource
+  2. decoded_audio — supplied by MiotProxy
 
 Buffers fragments in a 2-track MultiTrackSyncBuffer per device. The sync
 buffer handles time-windowed A/V alignment automatically.
@@ -30,6 +30,10 @@ from miloco.miot.client import MiotProxy
 from miloco.miot.schema import CameraInfo
 from miloco.node_monitor import NodeName, get_monitor
 from miloco.perception.collect.adapter_base import BaseDeviceAdapter
+from miloco.perception.collect.camera_stream import (
+    CameraVideoStreamSource,
+    MiotCameraVideoStreamSource,
+)
 from miloco.perception.collect.stream_buffer import (
     MultiTrackSyncBuffer,
     StreamFragment,
@@ -134,9 +138,15 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         self,
         miot_proxy: MiotProxy,
         on_window_ready: Callable[[], None] | None = None,
+        video_stream_source: CameraVideoStreamSource | None = None,
     ):
         self._miot_proxy = miot_proxy
         self._on_window_ready = on_window_ready
+        self._video_stream_source = (
+            video_stream_source
+            if video_stream_source is not None
+            else MiotCameraVideoStreamSource(miot_proxy)
+        )
         self._devices: dict[str, _CameraDeviceState] = {}
         self._last_ondemand_refresh_ms = 0
         # 静默重连防抖标记：did -> 最近一次重连的 monotonic ms。
@@ -473,7 +483,7 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
 
         # Subscribe decoded video frame stream (multi-reg)
         try:
-            reg_id = await self._miot_proxy.start_camera_decode_video_stream(
+            reg_id = await self._video_stream_source.start(
                 physical_did, channel,
                 self._make_decoded_video_callback(did, state),
             )
@@ -519,7 +529,7 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
 
         if state.decoded_video_reg_id >= 0:
             try:
-                await self._miot_proxy.stop_camera_decode_video_stream(
+                await self._video_stream_source.stop(
                     physical_did, channel, state.decoded_video_reg_id
                 )
             except Exception as e:
