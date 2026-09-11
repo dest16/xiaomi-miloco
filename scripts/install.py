@@ -596,6 +596,7 @@ class Installer:
         downloader: Downloader,
         *,
         dev: bool = False,
+        local_dist: bool = False,
         omni_api_key: str | None = None,
         account_auth: str | None = None,
         miloco_home: Path,
@@ -606,6 +607,7 @@ class Installer:
         self.ui = ui
         self.downloader = downloader
         self.dev = dev
+        self.local_dist = local_dist
         self.omni_api_key = omni_api_key
         self.account_auth = account_auth
         self.miloco_home = miloco_home
@@ -617,9 +619,12 @@ class Installer:
         self._src_dir: Path | None = None
         self._keep_cache = False
         self._service_started = False
+        self._local_dist_validated = False
 
     def run(self) -> None:
         self._print_welcome()
+        if self.local_dist:
+            self._validate_local_dist()
         if self.dev:
             self._run_dev_build()
         self._service_started = False
@@ -683,6 +688,64 @@ class Installer:
 
     # ── Dev build ──────────────────────────────────────────
 
+    def _validate_local_dist(self) -> None:
+        """Fail before installation if the prebuilt local bundle is incomplete."""
+        if self._local_dist_validated:
+            return
+
+        tag = self.platform.wheel_platform_tag
+        checks: list[tuple[str, Callable[[], list[Path]]]] = [
+            (
+                f"miloco_miot-*{tag}*.whl",
+                lambda: _visible(self.dist_dir.glob(f"miloco_miot-*{tag}*.whl")),
+            ),
+            (
+                "miloco-*.whl",
+                lambda: [
+                    path
+                    for path in _visible(self.dist_dir.glob("miloco-*.whl"))
+                    if "miloco_miot" not in path.name
+                    and "miloco_cli" not in path.name
+                ],
+            ),
+            (
+                "miloco_cli-*.whl",
+                lambda: _visible(self.dist_dir.glob("miloco_cli-*.whl")),
+            ),
+            (
+                "miloco-models-*.tar.gz",
+                lambda: _visible(self.dist_dir.glob("miloco-models-*.tar.gz")),
+            ),
+        ]
+        if self.agent_platform == "hermes":
+            checks.append(
+                (
+                    "miloco-hermes-plugin-*.tar.gz",
+                    lambda: _visible(
+                        self.dist_dir.glob("miloco-hermes-plugin-*.tar.gz")
+                    ),
+                )
+            )
+        elif not self.skip_openclaw:
+            checks.append(
+                (
+                    "miloco-openclaw-plugin-*.tgz",
+                    lambda: _visible(
+                        self.dist_dir.glob("miloco-openclaw-plugin-*.tgz")
+                    ),
+                )
+            )
+
+        missing = [pattern for pattern, find in checks if not find()]
+        if not self.dist_dir.is_dir() or missing:
+            detail = ", ".join(missing) if missing else str(self.dist_dir)
+            self.ui.fail(
+                self.ui.i18n.t(
+                    "error.local_dist_incomplete", str(self.dist_dir), detail
+                )
+            )
+        self._local_dist_validated = True
+
     def _run_dev_build(self) -> None:
         """--dev：从源码完整跑一遍 build.sh，确保每次 install 都装最新产物。
 
@@ -714,7 +777,9 @@ class Installer:
     def _step_install(self) -> None:
         self._step_header("install.title", "install.subtitle")
         # dev 装本地 dist/；release 装下载归档解压后的缓存目录（见 _get_src_dir）。
-        self._install_from_dir(self._get_src_dir(), reinstall=self.dev)
+        self._install_from_dir(
+            self._get_src_dir(), reinstall=self.dev or self.local_dist
+        )
         self._install_supervisor()
         self._configure_python_bin()
 
@@ -759,9 +824,13 @@ class Installer:
         self.ui.step_ok(self.ui.i18n.t("install.cli_ok"))
 
     def _get_src_dir(self) -> Path:
-        """安装产物目录（进程内 memoize）：dev=仓库 dist/；release=下载归档解压后的缓存目录。"""
+        """安装产物目录（进程内 memoize）：dev/local-dist=仓库 dist/；release=下载缓存。"""
         if self._src_dir is None:
-            self._src_dir = self.dist_dir if self.dev else self._fetch_release_bundle()
+            self._src_dir = (
+                self.dist_dir
+                if self.dev or self.local_dist
+                else self._fetch_release_bundle()
+            )
         return self._src_dir
 
     def _fetch_release_bundle(self) -> Path:
@@ -825,7 +894,7 @@ class Installer:
 
     def _cleanup_install_cache(self) -> None:
         # dev 无缓存；agent step1 须保留缓存供 step3 复用 → 跳过清理。
-        if self.dev or self._keep_cache:
+        if self.dev or self.local_dist or self._keep_cache:
             return
         shutil.rmtree(self.miloco_home / ".install-cache", ignore_errors=True)
 
@@ -1560,6 +1629,8 @@ class Installer:
     def run_agent_step1(self) -> None:
         """Step 1: env check, install, service init. Output JSON status."""
         self._print_welcome()
+        if self.local_dist:
+            self._validate_local_dist()
         # dev 下在 prepare 阶段构建一次；finish (step3) 复用产物不再构建。
         if self.dev:
             self._run_dev_build()
@@ -1600,6 +1671,8 @@ class Installer:
     ) -> None:
         """Step 3: service init, configure account/model, download, plugin."""
         self._print_welcome()
+        if self.local_dist:
+            self._validate_local_dist()
         self._service_started = False
         # download 前置到 service 之前：与 Installer.run 对齐；step1 已解压过时再解一次
         # 幂等（tar 覆盖同名文件），代价 <1s，换来 step1 未跑到解压时的兜底补齐。
@@ -1792,10 +1865,17 @@ class Uninstaller:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Miloco Installer")
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
         "--dev",
         action="store_true",
         help="Dev install: build from source (scripts/build.sh) then install from dist/",
+    )
+    source.add_argument(
+        "--local-dist",
+        dest="local_dist",
+        action="store_true",
+        help="Install from the repository dist/ without building or downloading",
     )
     parser.add_argument("--lang", default=None, help="Language (en/zh)")
     parser.add_argument(
@@ -1920,6 +2000,7 @@ def main() -> None:
             ui=ui,
             downloader=downloader,
             dev=args.dev,
+            local_dist=args.local_dist,
             omni_api_key=args.omni_api_key,
             account_auth=args.account_auth,
             miloco_home=miloco_home,
@@ -1969,6 +2050,7 @@ def main() -> None:
         ui=ui,
         downloader=downloader,
         dev=args.dev,
+        local_dist=args.local_dist,
         omni_api_key=args.omni_api_key,
         account_auth=args.account_auth,
         miloco_home=miloco_home,

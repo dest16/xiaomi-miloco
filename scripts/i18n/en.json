@@ -108,6 +108,7 @@
   "error.no_miot_wheel": "No miloco-miot wheel found for platform: %1",
   "error.no_bundle": "No release package for platform: %1",
   "error.dist_not_found": "dist directory not found: %1",
+  "error.local_dist_incomplete": "local dist incomplete at %1; missing: %2",
   "error.dev_outside_repo": "--dev must run inside the repo (scripts/build.sh not found; the self-contained installer does not support --dev)",
   "error.non_interactive": "Non-interactive terminal detected. Cannot proceed.",
   "error.non_interactive_hint": "Run in an interactive terminal, or use --omni-api-key for unattended install.",

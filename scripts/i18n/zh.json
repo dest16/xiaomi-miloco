@@ -108,6 +108,7 @@
   "error.no_miot_wheel": "未找到当前平台的 miloco-miot wheel: %1",
   "error.no_bundle": "没有该平台的发布包: %1",
   "error.dist_not_found": "dist 目录不存在: %1",
+  "error.local_dist_incomplete": "本地 dist 不完整（%1）；缺少：%2",
   "error.dev_outside_repo": "--dev 需在仓库内运行（未找到 scripts/build.sh；自包含安装脚本不支持 --dev）",
   "error.non_interactive": "检测到非交互式终端，无法继续安装",
   "error.non_interactive_hint": "请在交互式终端中运行，或使用 --omni-api-key 进行无人值守安装",

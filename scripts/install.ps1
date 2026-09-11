@@ -5,7 +5,7 @@
 # Ensures uv + Python are available, then delegates to install.py.
 #
 # Usage: .\scripts\install.ps1 [options]
-# Options are forwarded to install.py (--dev, --lang, --omni-api-key, --uninstall, -h)
+# Options are forwarded to install.py (--dev, --local-dist, --lang, --omni-api-key, --uninstall, -h)
 
 $ErrorActionPreference = "Stop"
 

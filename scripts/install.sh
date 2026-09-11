@@ -6,7 +6,7 @@
 # Ensures uv + Python are available, then delegates to install.py.
 #
 # Usage: bash scripts/install.sh [options]
-# Options are forwarded to install.py (--dev, --lang, --omni-api-key, --uninstall, -h)
+# Options are forwarded to install.py (--dev, --local-dist, --lang, --omni-api-key, --uninstall, -h)
 set -euo pipefail
 
 # ── Colors (bootstrap phase only) ─────────────────────────
