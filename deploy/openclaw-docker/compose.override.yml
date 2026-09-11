@@ -1,0 +1,28 @@
+services:
+  openclaw-gateway:
+    image: ${MILOCO_OPENCLAW_IMAGE:-openclaw-miloco-dev:local}
+    build:
+      context: ${MILOCO_SOURCE_DIR}/deploy/openclaw-docker
+      dockerfile: Dockerfile
+      args:
+        OPENCLAW_IMAGE: ${OPENCLAW_IMAGE}
+    environment:
+      MILOCO_HOME: /home/node/.openclaw/miloco
+      PATH: /home/node/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    volumes:
+      - ${MILOCO_SOURCE_DIR}:/opt/xiaomi-miloco-source:ro
+      - ${OPENCLAW_LOCAL_DIR}:/home/node/.local
+
+  openclaw-cli:
+    image: ${MILOCO_OPENCLAW_IMAGE:-openclaw-miloco-dev:local}
+    build:
+      context: ${MILOCO_SOURCE_DIR}/deploy/openclaw-docker
+      dockerfile: Dockerfile
+      args:
+        OPENCLAW_IMAGE: ${OPENCLAW_IMAGE}
+    environment:
+      MILOCO_HOME: /home/node/.openclaw/miloco
+      PATH: /home/node/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    volumes:
+      - ${MILOCO_SOURCE_DIR}:/opt/xiaomi-miloco-source:ro
+      - ${OPENCLAW_LOCAL_DIR}:/home/node/.local
