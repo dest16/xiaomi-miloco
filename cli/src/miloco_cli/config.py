@@ -24,6 +24,7 @@ import tempfile
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 def miloco_home() -> Path:
@@ -138,6 +139,11 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         int,
         4,
         "感知窗口时长（秒），重启生效",
+    ),
+    "camera.external_streams": (
+        list,
+        [],
+        "按 physical_did + channel 配置外部 RTSP 视频源；未配置的通道保持 MIoT 视频，重启生效",
     ),
     # 实验性功能开关（与 backend FeaturesSettings 对齐；住户在 web 显式开启，也可用本命令）
     "features.pet_recognition": (
@@ -318,6 +324,49 @@ def _coerce(path: str, raw: str) -> Any:
             return float(raw)
         except ValueError as exc:
             raise ValueError(f"{path} 需要浮点数，收到 {raw!r}") from exc
+    if pytype is list:
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path} 需要 JSON 数组") from exc
+        if not isinstance(value, list):
+            raise ValueError(f"{path} 需要 JSON 数组")
+        if path == "camera.external_streams":
+            identities: set[tuple[str, int]] = set()
+            normalized: list[dict[str, Any]] = []
+            for index, item in enumerate(value):
+                if not isinstance(item, dict):
+                    raise ValueError(f"{path}[{index}] 需要对象")
+                did = item.get("physical_did")
+                channel = item.get("channel", 0)
+                url = item.get("url")
+                if not isinstance(did, str) or not did.strip():
+                    raise ValueError(f"{path}[{index}].physical_did 不能为空")
+                if (
+                    isinstance(channel, bool)
+                    or not isinstance(channel, int)
+                    or channel < 0
+                ):
+                    raise ValueError(f"{path}[{index}].channel 需要非负整数")
+                if not isinstance(url, str):
+                    raise ValueError(f"{path}[{index}].url 需要 RTSP URL")
+                try:
+                    parsed = urlsplit(url)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{path}[{index}].url 需要含主机的 RTSP/RSTPS URL"
+                    ) from exc
+                if parsed.scheme not in {"rtsp", "rtsps"} or not parsed.hostname:
+                    raise ValueError(f"{path}[{index}].url 需要含主机的 RTSP/RSTPS URL")
+                identity = (did.strip(), channel)
+                if identity in identities:
+                    raise ValueError(f"{path} 中 physical_did/channel 不得重复")
+                identities.add(identity)
+                normalized.append(
+                    {"physical_did": did.strip(), "channel": channel, "url": url}
+                )
+            return normalized
+        return value
     # timezone 额外做 IANA 名校验（与 backend settings 的 field_validator 对齐），
     # 拦住 "Beijing" / "+08:00" 这类会让 backend 启动期 ValidationError 的脏值。
     if path == "timezone" and raw:

@@ -33,6 +33,7 @@ from miloco.perception.collect.adapter_base import BaseDeviceAdapter
 from miloco.perception.collect.camera_stream import (
     CameraVideoStreamSource,
     MiotCameraVideoStreamSource,
+    uses_external_video_stream,
 )
 from miloco.perception.collect.stream_buffer import (
     MultiTrackSyncBuffer,
@@ -362,6 +363,11 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         # 还是同一个物理会话，几毫秒内 destroy 两次，四镜头就是四次）。
         stalled_by_physical: dict[str, list[str]] = {}
         for did, state in list(self._devices.items()):
+            physical_did, channel = split_channel_did(did)
+            if uses_external_video_stream(
+                self._video_stream_source, physical_did, channel
+            ):
+                continue
             # 首帧未到 → 用「订阅时刻」判，阈值放宽到 _FIRST_FRAME_THRESHOLD_MS
             # （连接刚建立确实要等十几秒）；首帧已到 → 用「最后一帧时刻」判，
             # 阈值 _SILENCE_THRESHOLD_MS。
@@ -375,7 +381,6 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                     continue
             elif now_ms - state.last_video_frame_ms < _SILENCE_THRESHOLD_MS:
                 continue
-            physical_did, _ = split_channel_did(did)
             cam = self._miot_proxy.get_cached_camera(physical_did)
             # 云端已离线 → 救不活，交给基类按在线态断开，别白重连。
             if cam is not None and not cam.online:

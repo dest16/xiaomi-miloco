@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import sys
+from urllib.parse import urlsplit, urlunsplit
 
 import click
 
@@ -27,6 +28,38 @@ from miloco_cli.config import (
 from miloco_cli.output import print_result
 
 
+def _redact_rtsp_url(url: str) -> str:
+    """Remove RTSP credentials, query tokens, and fragments from CLI output."""
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname or "<unknown-host>"
+        if ":" in host:
+            host = f"[{host}]"
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        userinfo = "***:***@" if parsed.username is not None else ""
+        return urlunsplit(
+            (parsed.scheme or "rtsp", f"{userinfo}{host}", parsed.path, "", "")
+        )
+    except ValueError:
+        return "rtsp://<redacted>"
+
+
+def _mask_external_streams(value):
+    if not isinstance(value, list):
+        return value
+    masked = []
+    for item in value:
+        if not isinstance(item, dict):
+            masked.append(item)
+            continue
+        entry = dict(item)
+        if isinstance(entry.get("url"), str):
+            entry["url"] = _redact_rtsp_url(entry["url"])
+        masked.append(entry)
+    return masked
+
+
 def _mask(data: dict) -> dict:
     """敏感字段展示时做掩码。"""
     masked = json.loads(json.dumps(data))  # 深拷贝
@@ -37,6 +70,10 @@ def _mask(data: dict) -> dict:
     omni = model.get("omni") or {}
     if omni.get("api_key"):
         omni["api_key"] = "***"
+    camera = masked.get("camera") or {}
+    camera["external_streams"] = _mask_external_streams(
+        camera.get("external_streams", [])
+    )
     return masked
 
 
@@ -71,8 +108,13 @@ def config_get(path: str, pretty: bool, value_only: bool):
     except KeyError:
         print(json.dumps({"error": f"path not found: {path}"}), file=sys.stderr)
         sys.exit(1)
+    if path == "camera.external_streams":
+        value = _mask_external_streams(value)
     if value_only:
-        print("" if value is None else value)
+        if isinstance(value, (dict, list)):
+            print(json.dumps(value, ensure_ascii=False))
+        else:
+            print("" if value is None else value)
         return
     print_result({"path": path, "value": value}, pretty)
 
@@ -124,9 +166,23 @@ def config_set(ctx, items: tuple[str, ...], no_restart: bool, pretty: bool):
     if len(pairs) == 1:
         only = pairs[0][0]
         result["path"] = only
-        result["value"] = persisted[only]
+        result["value"] = (
+            _mask_external_streams(persisted[only])
+            if only == "camera.external_streams"
+            else persisted[only]
+        )
     else:
-        result["updated"] = [{"path": p, "value": persisted[p]} for p, _ in pairs]
+        result["updated"] = [
+            {
+                "path": p,
+                "value": (
+                    _mask_external_streams(persisted[p])
+                    if p == "camera.external_streams"
+                    else persisted[p]
+                ),
+            }
+            for p, _ in pairs
+        ]
 
     if not no_restart:
         restart_info = _restart_if_running(pretty)

@@ -71,3 +71,13 @@ class MiotCameraVideoStreamSource:
             channel,
             registration_id,
         )
+
+
+def uses_external_video_stream(
+    source: CameraVideoStreamSource,
+    camera_id: str,
+    channel: int,
+) -> bool:
+    """Return whether silence/reconnect is owned by an external source."""
+    predicate = getattr(source, "uses_external_stream", None)
+    return bool(predicate and predicate(camera_id, channel))

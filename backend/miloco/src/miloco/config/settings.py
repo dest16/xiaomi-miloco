@@ -18,9 +18,17 @@ import logging
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar, Literal
+from urllib.parse import urlsplit
 
 import yaml
-from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    SecretStr,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -270,11 +278,53 @@ class SchedulerSettings(BaseModel):
     )
 
 
+class ExternalCameraStreamSettings(BaseModel):
+    """An external RTSP video override for one physical camera channel."""
+
+    physical_did: str = Field(description="MIoT physical camera DID")
+    channel: int = Field(default=0, ge=0, description="Camera channel number")
+    url: SecretStr = Field(description="RTSP/RSTPS URL (kept secret in repr/errors)")
+
+    @field_validator("physical_did")
+    @classmethod
+    def _validate_physical_did(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("physical_did must not be empty")
+        return value
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, value: SecretStr) -> SecretStr:
+        try:
+            parsed = urlsplit(value.get_secret_value())
+        except ValueError as exc:
+            raise ValueError("url must be a valid RTSP URL with a host") from exc
+        if parsed.scheme not in {"rtsp", "rtsps"} or not parsed.hostname:
+            raise ValueError("url must be a valid RTSP URL with a host")
+        return value
+
+
 class CameraSettings(BaseModel):
     """摄像头采集参数。"""
 
     frame_interval: int = Field(default=1000, description="帧采集间隔（毫秒）")
     max_cache_images: int = Field(default=6, description="最大缓存图像数量")
+    external_streams: list[ExternalCameraStreamSettings] = Field(
+        default_factory=list,
+        description="按物理 DID + 通道覆盖 MIoT 视频的外部 RTSP 源",
+    )
+
+    @model_validator(mode="after")
+    def _unique_external_streams(self) -> "CameraSettings":
+        identities = [
+            (item.physical_did, item.channel) for item in self.external_streams
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError(
+                "camera.external_streams contains duplicate physical_did/channel"
+            )
+        return self
 
 
 class RuleSettings(BaseModel):

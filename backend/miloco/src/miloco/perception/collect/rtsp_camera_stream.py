@@ -98,6 +98,10 @@ class RtspCameraVideoStreamSource:
         with self._state_lock:
             return self._thread is not None and self._thread.is_alive()
 
+    def uses_external_stream(self, camera_id: str, channel: int) -> bool:
+        """RTSP owns reconnect; MIoT's silence watchdog must ignore it."""
+        return True
+
     async def start(
         self,
         camera_id: str,

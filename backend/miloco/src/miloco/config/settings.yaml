@@ -63,6 +63,7 @@ notify:
 camera:
   frame_interval: 1000   # 帧采集间隔（毫秒）
   max_cache_images: 6    # 最大缓存图像数量
+  external_streams: []   # 按 physical_did + channel 配置外部 RTSP 视频源；空列表保持 MIoT 原行为
 
 # 规则引擎相关配置
 rule:

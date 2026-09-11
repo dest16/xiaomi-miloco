@@ -9,6 +9,9 @@ from miloco.database.on_demand_log_repo import OnDemandLogRepo
 from miloco.database.perception_repo import PerceptionLogRepo
 from miloco.perception.client import PerceptionEngineProxy
 from miloco.perception.collect.camera_adapter import CameraDeviceAdapter
+from miloco.perception.collect.camera_stream_selector import (
+    create_camera_video_stream_source,
+)
 from miloco.perception.collect.collector import MultimodalCollector
 from miloco.perception.processor import PipelineProcessor
 
@@ -37,6 +40,7 @@ async def init_perception_module(miot_proxy, kv_repo):
     camera_adapter = CameraDeviceAdapter(
         miot_proxy,
         on_window_ready=lambda: loop.call_soon_threadsafe(window_ready_event.set),
+        video_stream_source=create_camera_video_stream_source(miot_proxy),
     )
 
     # 4. 初始化多模态收集器
