@@ -1,28 +1,43 @@
 services:
-  openclaw-gateway:
-    image: ${MILOCO_OPENCLAW_IMAGE:-openclaw-miloco-dev:local}
+  miloco-builder:
+    profiles:
+      - build
+    image: miloco-builder:local
     build:
       context: ${MILOCO_SOURCE_DIR}/deploy/openclaw-docker
-      dockerfile: Dockerfile
-      args:
-        OPENCLAW_IMAGE: ${OPENCLAW_IMAGE}
+      dockerfile: Dockerfile.builder
+    user: "${MILOCO_BUILDER_UID:-1000}:${MILOCO_BUILDER_GID:-1000}"
+    volumes:
+      - ${MILOCO_SOURCE_DIR}:/src:ro
+      - ${MILOCO_DIST_DIR}:/out
+    command:
+      - bash
+      - -lc
+      - |
+        rm -rf /tmp/miloco-build
+        mkdir -p /tmp/miloco-build
+        cp -a /src/. /tmp/miloco-build/
+        cd /tmp/miloco-build
+        bash scripts/build.sh
+        find /out -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+        cp -a dist/. /out/
+
+  openclaw-gateway:
+    image: ${OPENCLAW_IMAGE}
     environment:
       MILOCO_HOME: /home/node/.openclaw/miloco
       PATH: /home/node/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     volumes:
-      - ${MILOCO_SOURCE_DIR}:/opt/xiaomi-miloco-source:ro
+      - ${MILOCO_SOURCE_DIR}/scripts:/opt/xiaomi-miloco-installer/scripts:ro
+      - ${MILOCO_DIST_DIR}:/opt/xiaomi-miloco-installer/dist:ro
       - ${OPENCLAW_LOCAL_DIR}:/home/node/.local
 
   openclaw-cli:
-    image: ${MILOCO_OPENCLAW_IMAGE:-openclaw-miloco-dev:local}
-    build:
-      context: ${MILOCO_SOURCE_DIR}/deploy/openclaw-docker
-      dockerfile: Dockerfile
-      args:
-        OPENCLAW_IMAGE: ${OPENCLAW_IMAGE}
+    image: ${OPENCLAW_IMAGE}
     environment:
       MILOCO_HOME: /home/node/.openclaw/miloco
       PATH: /home/node/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     volumes:
-      - ${MILOCO_SOURCE_DIR}:/opt/xiaomi-miloco-source:ro
+      - ${MILOCO_SOURCE_DIR}/scripts:/opt/xiaomi-miloco-installer/scripts:ro
+      - ${MILOCO_DIST_DIR}:/opt/xiaomi-miloco-installer/dist:ro
       - ${OPENCLAW_LOCAL_DIR}:/home/node/.local

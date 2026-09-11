@@ -1,147 +1,183 @@
-# Dockerized OpenClaw development initialization
+# OpenClaw runtime with an isolated MiLoCo builder
 
-This override keeps MiLoCo in the existing OpenClaw runtime, matching the
-plugin's native `miloco-cli service restart/stop` lifecycle. It does not add a
-second backend container or change the existing OpenClaw network, ports,
-gateway token, config, workspace, or auth mounts.
+This deployment keeps the existing official OpenClaw runtime image unchanged.
+MiLoCo is built in a separate, disposable builder container. The builder
+writes a complete `dist/` bundle to the host; the runtime sees only that bundle
+and the official installer scripts, both read-only.
 
-The current official OpenClaw runtime already contains Python 3, curl, git,
-npm, and pnpm. The thin derivative image adds only `rsync`, which
-`scripts/build.sh` uses while staging `miloco-miot`.
+No second MiLoCo backend container is introduced. The existing OpenClaw state,
+workspace, auth, network, ports, and gateway token continue to come from the
+base Compose file.
+
+## Why the split is required
+
+`scripts/build.sh` requires `rsync`, Python, uv, npm, and pnpm. Those are build
+dependencies, not OpenClaw runtime dependencies. The previous derivative image
+installed `rsync` into OpenClaw and then built the fork inside the runtime.
+This override removes that image entirely.
+
+`scripts/install.py --local-dist` performs the same install, model extraction,
+service initialization, account binding, model configuration, and plugin
+installation as the normal official installer. It only changes the artifact
+source: it uses the adjacent `dist/`, skips `scripts/build.sh`, and never
+downloads a release fallback. Before changing the installation it requires the
+platform-specific MIoT wheel, MiLoCo wheel, CLI wheel, models archive, and
+OpenClaw plugin package.
 
 ## Persistent paths
 
-- `/home/node/.openclaw` remains the existing OpenClaw state mount. MiLoCo uses
-  `/home/node/.openclaw/miloco` for `config.json`, databases, models, logs, and
-  other runtime data.
-- `/home/node/.local` must be mounted persistently. The official installer puts
-  `uv` and command shims in `.local/bin`; uv tool environments, downloaded
-  Python runtimes, and the writable fork mirror are stored below `.local`.
-- The host fork checkout is mounted read-only at
-  `/opt/xiaomi-miloco-source`. It is copied to
-  `/home/node/.local/src/xiaomi-miloco` before each dev installation so the
-  build can write `dist`, package-manager state, and temporary build files
-  without changing host ownership or polluting the checkout.
+- The base deployment's `/home/node/.openclaw` mount remains authoritative for
+  OpenClaw and MiLoCo runtime state. MiLoCo uses
+  `/home/node/.openclaw/miloco`.
+- `${OPENCLAW_LOCAL_DIR}` is mounted at `/home/node/.local` and persists uv,
+  downloaded Python runtimes, command shims, and uv tool environments.
+- `${MILOCO_DIST_DIR}` is the builder's persistent output. It is writable only
+  in the builder and read-only at `/opt/xiaomi-miloco-installer/dist` in
+  OpenClaw.
+- Only `${MILOCO_SOURCE_DIR}/scripts` is mounted into OpenClaw, read-only. The
+  fork source tree is never mounted into the runtime.
 
-## Apply the override
+## One-time setup
 
-Run these commands on the Unraid host from the directory containing the
-existing official OpenClaw `docker-compose.yml`. Replace the two `/path/...`
-values and edit the copied env file before building.
+Run from the directory containing the existing official OpenClaw
+`docker-compose.yml`. Replace `/path/to/xiaomi-miloco`, copy the example, then
+set `OPENCLAW_IMAGE` to the exact official image reference already used by the
+deployment. Do not use `latest`.
 
 ```bash
-cp /path/to/xiaomi-miloco/deploy/openclaw-docker/.env.example ./miloco-dev.env
-vi ./miloco-dev.env
+cp /path/to/xiaomi-miloco/deploy/openclaw-docker/.env.example ./miloco.env
+vi ./miloco.env
 
-# Create the bind-mounted user-local directory for OpenClaw's uid 1000.
-# Use the OPENCLAW_LOCAL_DIR value selected in miloco-dev.env.
+mkdir -p /mnt/user/appdata/xiaomi-miloco-dist
 mkdir -p /mnt/user/appdata/openclaw/.local
+chown -R 1000:1000 /mnt/user/appdata/xiaomi-miloco-dist
 chown -R 1000:1000 /mnt/user/appdata/openclaw/.local
 
-docker compose --env-file ./miloco-dev.env \
-  -f ./docker-compose.yml \
-  -f /path/to/xiaomi-miloco/deploy/openclaw-docker/compose.override.yml \
-  stop openclaw-gateway
-
-docker compose --env-file ./miloco-dev.env \
-  -f ./docker-compose.yml \
-  -f /path/to/xiaomi-miloco/deploy/openclaw-docker/compose.override.yml \
-  build openclaw-gateway
-
-docker compose --env-file ./miloco-dev.env \
-  -f ./docker-compose.yml \
-  -f /path/to/xiaomi-miloco/deploy/openclaw-docker/compose.override.yml \
-  up -d openclaw-gateway
+dc() {
+  docker compose --env-file ./miloco.env \
+    -f ./docker-compose.yml \
+    -f /path/to/xiaomi-miloco/deploy/openclaw-docker/compose.override.yml \
+    "$@"
+}
 ```
 
-The override adds volumes; Compose retains the existing `/home/node/.openclaw`,
-workspace, auth, and `ai-core` network configuration from the base file.
-
-## Install this fork
-
-First verify the read-only checkout, then create an exact writable mirror and
-run the repository's official interactive dev installer. Do not use the Xiaomi
-release installer URL: that would install upstream instead of this fork.
+Confirm that Compose resolves both OpenClaw services to the same pinned
+official image before starting:
 
 ```bash
-docker compose --env-file ./miloco-dev.env \
-  -f ./docker-compose.yml \
-  -f /path/to/xiaomi-miloco/deploy/openclaw-docker/compose.override.yml \
-  exec openclaw-gateway test -f /opt/xiaomi-miloco-source/scripts/install.sh
-
-docker compose --env-file ./miloco-dev.env \
-  -f ./docker-compose.yml \
-  -f /path/to/xiaomi-miloco/deploy/openclaw-docker/compose.override.yml \
-  exec openclaw-gateway bash -lc '
-    mkdir -p /home/node/.local/src/xiaomi-miloco &&
-    rsync -a --delete \
-      --exclude=.venv/ --exclude=backend/.venv/ --exclude=node_modules/ \
-      --exclude=dist/ --exclude=build/ --exclude=__pycache__/ \
-      /opt/xiaomi-miloco-source/ /home/node/.local/src/xiaomi-miloco/ &&
-    cd /home/node/.local/src/xiaomi-miloco &&
-    bash scripts/install.sh --dev
-  '
+dc config --images
 ```
 
-Complete the official interactive Mi Home account binding and Omni model
-configuration. The installer builds all fork packages, installs `miloco`,
-`miloco-cli`, and supervisor with uv, and installs the generated OpenClaw
-plugin. It intentionally stops the temporary backend when installation exits.
+## Build flow
 
-Start MiLoCo and restart the gateway so the freshly installed plugin is loaded:
+The source checkout is read-only in the builder. It is copied to disposable
+container storage because the official `build.sh` legitimately writes package
+metadata and temporary build files. Only the completed `dist/` is copied to
+the host output directory.
 
 ```bash
-docker compose --env-file ./miloco-dev.env \
-  -f ./docker-compose.yml \
-  -f /path/to/xiaomi-miloco/deploy/openclaw-docker/compose.override.yml \
-  exec openclaw-gateway miloco-cli service start
+dc --profile build build miloco-builder
+dc --profile build run --rm miloco-builder
 
-docker compose --env-file ./miloco-dev.env \
-  -f ./docker-compose.yml \
-  -f /path/to/xiaomi-miloco/deploy/openclaw-docker/compose.override.yml \
-  restart openclaw-gateway
+find /mnt/user/appdata/xiaomi-miloco-dist -maxdepth 1 -type f -printf '%f\n' | sort
+```
+
+The output must include a `miloco_miot` wheel matching the runtime
+architecture, a `miloco` wheel, a `miloco_cli` wheel,
+`miloco-models-*.tar.gz`, and `miloco-openclaw-plugin-*.tgz`.
+
+## Start the unchanged runtime
+
+```bash
+dc up -d --force-recreate openclaw-gateway
+```
+
+The override has no runtime `build:` entry. `openclaw-gateway` and
+`openclaw-cli` both use `${OPENCLAW_IMAGE}` directly.
+
+## Install and initialize from local dist
+
+Run the official installer interactively inside the running official image:
+
+```bash
+dc exec openclaw-gateway \
+  bash /opt/xiaomi-miloco-installer/scripts/install.sh \
+  --local-dist --agent-platform openclaw
+```
+
+Complete the normal Mi Home account binding and Omni model configuration.
+This is the complete official initialization flow; it is not the reduced
+`sync-to-remote.sh --install-only` path. The temporary MiLoCo service is
+stopped when installation exits.
+
+Start MiLoCo and restart OpenClaw so it loads the newly installed plugin:
+
+```bash
+dc exec openclaw-gateway miloco-cli service start
+dc restart openclaw-gateway
 ```
 
 ## Configure external RTSP video
 
-The value is one JSON array. Identity is an exact physical DID and channel;
-channels not listed continue to use MIoT video.
+Existing camera configuration is unchanged. If this fork is already configured
+for external streams, keep the current value. To set it for the first time:
 
 ```bash
-docker compose --env-file ./miloco-dev.env \
-  -f ./docker-compose.yml \
-  -f /path/to/xiaomi-miloco/deploy/openclaw-docker/compose.override.yml \
-  exec openclaw-gateway miloco-cli config set camera.external_streams \
-  '[{"physical_did":"<CAMERA_1_DID>","channel":0,"url":"rtsp://10.10.0.1:8554/camera1"},{"physical_did":"<CAMERA_2_DID>","channel":0,"url":"rtsp://10.10.0.1:8554/camera2"}]'
+dc exec openclaw-gateway miloco-cli config set camera.external_streams \
+  '[{"physical_did":"<CAMERA_1_DID>","channel":0,"url":"rtsp://10.10.0.1:8554/camera1"}]'
 ```
-
-`config set` restarts a running backend. External RTSP credentials and query
-tokens are redacted by `config show`, `config get`, set results, and runtime
-logs. `config show --unmasked` is the existing explicit debugging escape hatch.
 
 ## Verify
 
 ```bash
-docker compose --env-file ./miloco-dev.env \
-  -f ./docker-compose.yml \
-  -f /path/to/xiaomi-miloco/deploy/openclaw-docker/compose.override.yml \
-  exec openclaw-gateway bash -lc '
-    openclaw --version &&
-    openclaw plugins list &&
-    miloco-cli --version &&
-    miloco-cli service status &&
-    miloco-cli config show &&
-    miloco-cli device list &&
-    curl --fail --silent http://127.0.0.1:1810/health
-  '
+dc exec openclaw-gateway bash -lc '
+  openclaw --version &&
+  openclaw plugins list &&
+  miloco-cli --version &&
+  miloco-cli service status &&
+  curl --fail --silent http://127.0.0.1:1810/health &&
+  MILOCO_PYTHON="$(miloco-cli config get server.python_bin --value-only)" &&
+  "$MILOCO_PYTHON" -c "from miloco.perception.collect.rtsp_camera_stream import RtspCameraVideoStreamSource; from miloco.perception.collect.camera_stream_selector import ConfiguredCameraVideoStreamSource; print(\"fork imports ok\")"
+'
 
-docker compose --env-file ./miloco-dev.env \
-  -f ./docker-compose.yml \
-  -f /path/to/xiaomi-miloco/deploy/openclaw-docker/compose.override.yml \
-  exec openclaw-gateway miloco-cli service logs --lines 300
+dc exec openclaw-gateway miloco-cli service logs --lines 300
 ```
 
-For each override, logs must show the external-source selection and RTSP
-connection. They must not show an MIoT video subscription for that exact DID
-and channel. Disconnecting RTSP should produce RTSP reconnect messages while
-the source-selection decision remains external; it never falls back to MIoT.
+Also inspect the runtime rather than the builder when checking for leaked build
+tools:
+
+```bash
+dc exec openclaw-gateway sh -lc '
+  if command -v rsync >/dev/null 2>&1; then
+    echo "unexpected: rsync exists in runtime" >&2
+    exit 1
+  fi
+  echo "runtime has no rsync"
+'
+```
+
+## Upgrade flow
+
+1. Update the fork checkout on the host.
+2. Rebuild the disposable builder and replace the persistent dist bundle.
+3. Re-run the complete local-dist installer.
+4. Restart OpenClaw.
+
+```bash
+git -C /mnt/user/appdata/xiaomi-miloco pull --ff-only
+dc --profile build build --pull miloco-builder
+dc --profile build run --rm miloco-builder
+dc exec openclaw-gateway \
+  bash /opt/xiaomi-miloco-installer/scripts/install.sh \
+  --local-dist --agent-platform openclaw
+dc exec openclaw-gateway miloco-cli service start
+dc restart openclaw-gateway
+```
+
+Changing OpenClaw itself is a separate operation. When intentionally upgrading
+it, first change `OPENCLAW_IMAGE` to the chosen exact official tag, then run:
+
+```bash
+dc pull openclaw-gateway openclaw-cli
+dc up -d --force-recreate openclaw-gateway
+```
