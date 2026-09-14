@@ -158,6 +158,72 @@ class TestCallbackIntegration:
         assert decoded.decoded_unix_ms == 1_700_000_004_995
         assert decoded.decode_latency_ms == 125.0
 
+    def test_video_frames_are_sampled_before_buffering(self, monkeypatch):
+        adapter, state = self._make_adapter_with_device()
+        clock = iter((1_000, 1_050, 1_333, 1_334, 1_666, 1_667))
+        monkeypatch.setattr(
+            "miloco.perception.collect.camera_adapter._monotonic_ms",
+            lambda: next(clock),
+        )
+
+        cb = adapter._make_decoded_video_callback("cam1", state)
+        for ts in (0, 50, 333, 334, 666, 667):
+            asyncio.run(
+                cb(
+                    "cam1",
+                    np.zeros((2, 2, 3), dtype=np.uint8),
+                    ts,
+                    0,
+                )
+            )
+
+        tracks = state.sync_buffer.peek_latest(duration_ms=10_000)
+        assert tracks is not None
+        kept = tracks["decoded_video"]
+        assert [frag.data.stream_ts for frag in kept] == [0, 333, 666]
+        # A discarded frame still proves that the source is alive.
+        assert state.last_video_frame_ms == 1_667
+
+    def test_sampling_skips_catch_up_burst_after_source_gap(self, monkeypatch):
+        adapter, state = self._make_adapter_with_device()
+        clock = iter((1_000, 10_000, 10_001))
+        monkeypatch.setattr(
+            "miloco.perception.collect.camera_adapter._monotonic_ms",
+            lambda: next(clock),
+        )
+
+        cb = adapter._make_decoded_video_callback("cam1", state)
+        for ts in (0, 9_000, 9_001):
+            asyncio.run(
+                cb(
+                    "cam1",
+                    np.zeros((2, 2, 3), dtype=np.uint8),
+                    ts,
+                    0,
+                )
+            )
+
+        tracks = state.sync_buffer.peek_latest(duration_ms=20_000)
+        assert tracks is not None
+        # The initial partial window is discarded by the sync buffer's
+        # existing startup rule; 9_001 is rejected by the sampler.
+        assert [
+            frag.data.stream_ts for frag in tracks["decoded_video"]
+        ] == [9_000]
+
+    def test_sampling_tracks_effective_omni_fps_adjustment(self, monkeypatch):
+        adapter, state = self._make_adapter_with_device()
+        monkeypatch.setattr(
+            CameraDeviceAdapter,
+            "_perception_video_fps",
+            staticmethod(lambda: 4),
+        )
+
+        assert adapter._should_buffer_video_frame(state, 1_000) is True
+        assert adapter._should_buffer_video_frame(state, 1_249) is False
+        assert adapter._should_buffer_video_frame(state, 1_250) is True
+        assert state.video_sample_interval_ms == 250
+
     def test_missing_device_is_noop(self, monkeypatch):
         adapter, state = self._make_adapter_with_device()
         cb = adapter._make_decoded_video_callback("cam_unknown", state)

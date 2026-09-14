@@ -64,6 +64,11 @@ camera:
   frame_interval: 1000   # 帧采集间隔（毫秒）
   max_cache_images: 6    # 最大缓存图像数量
   external_streams: []   # 按 physical_did + channel 配置外部 RTSP 视频源；空列表保持 MIoT 原行为
+  rtsp_cameras: []       # 独立于 MIoT 目录的标准 RTSP 摄像头
+  rtsp_decode:
+    backend: "auto"     # auto 优先 FFmpeg VAAPI，失败后回退 PyAV；也可强制 pyav / ffmpeg-vaapi
+    ffmpeg_path: "ffmpeg"
+    vaapi_device: "/dev/dri/renderD128"
 
 # 规则引擎相关配置
 rule:

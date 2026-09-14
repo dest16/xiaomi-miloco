@@ -41,3 +41,35 @@ def test_duplicate_external_camera_identity_is_rejected():
     item = {"physical_did": "cam", "channel": 0, "url": "rtsp://camera/live"}
     with pytest.raises(ValidationError, match="duplicate"):
         CameraSettings(external_streams=[item, item])
+
+
+def test_standalone_rtsp_camera_has_own_identity_and_metadata():
+    settings = CameraSettings(
+        rtsp_cameras=[
+            {
+                "id": " living-room ",
+                "name": " 客厅摄像头 ",
+                "room_name": " 客厅 ",
+                "url": "rtsp://go2rtc.local:8554/living-room",
+            }
+        ]
+    )
+    camera = settings.rtsp_cameras[0]
+    assert camera.id == "living-room"
+    assert camera.name == "客厅摄像头"
+    assert camera.room_name == "客厅"
+    assert camera.enabled is True
+
+
+def test_standalone_rtsp_camera_rejects_reserved_or_duplicate_ids():
+    item = {
+        "id": "camera:ch1",
+        "name": "camera",
+        "url": "rtsp://go2rtc.local/camera",
+    }
+    with pytest.raises(ValidationError, match="reserved"):
+        CameraSettings(rtsp_cameras=[item])
+
+    item["id"] = "camera"
+    with pytest.raises(ValidationError, match="duplicate"):
+        CameraSettings(rtsp_cameras=[item, item])

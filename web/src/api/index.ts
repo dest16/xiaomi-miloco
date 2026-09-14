@@ -827,3 +827,37 @@ export async function updateSchedulerConfig(
   );
   return r.data;
 }
+
+// Standalone RTSP cameras are independent from Xiaomi account devices.
+export interface RtspCameraConfig {
+  id: string;
+  name: string;
+  room_name: string;
+  url: string;
+  enabled: boolean;
+  source_type?: "rtsp";
+}
+
+export async function listRtspCameras(): Promise<RtspCameraConfig[]> {
+  const r = await apiFetch<{ code: number; data: RtspCameraConfig[] }>(
+    "/api/cameras",
+  );
+  return r.data;
+}
+
+export async function createRtspCamera(
+  input: Omit<RtspCameraConfig, "source_type">,
+): Promise<RtspCameraConfig> {
+  const r = await apiFetch<{ code: number; data: RtspCameraConfig }>(
+    "/api/cameras",
+    { method: "POST", body: JSON.stringify(input) },
+  );
+  return r.data;
+}
+
+export async function deleteRtspCamera(id: string): Promise<void> {
+  await apiFetch<{ code: number; data: null }>(
+    `/api/cameras/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+}

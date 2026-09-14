@@ -145,6 +145,21 @@ _SCHEMA_PATHS: dict[str, tuple[type, Any, str]] = {
         [],
         "按 physical_did + channel 配置外部 RTSP 视频源；未配置的通道保持 MIoT 视频，重启生效",
     ),
+    "camera.rtsp_decode.backend": (
+        str,
+        "auto",
+        "外部 RTSP 感知解码后端：auto 优先 FFmpeg VAAPI、失败回退 PyAV；也可强制 pyav 或 ffmpeg-vaapi，重启生效",
+    ),
+    "camera.rtsp_decode.ffmpeg_path": (
+        str,
+        "ffmpeg",
+        "FFmpeg 可执行文件路径，供外部 RTSP 感知硬解使用，重启生效",
+    ),
+    "camera.rtsp_decode.vaapi_device": (
+        str,
+        "/dev/dri/renderD128",
+        "VAAPI DRM render node；多 GPU 主机需指定实际 AMD 节点，重启生效",
+    ),
     # 实验性功能开关（与 backend FeaturesSettings 对齐；住户在 web 显式开启，也可用本命令）
     "features.pet_recognition": (
         bool,
@@ -393,6 +408,13 @@ def _coerce(path: str, raw: str) -> Any:
         if norm not in ("low", "medium", "high"):
             raise ValueError(
                 f"{path} 仅支持 low / medium / high，收到 {raw!r}"
+            )
+        return norm
+    if path == "camera.rtsp_decode.backend":
+        norm = raw.strip().lower()
+        if norm not in ("auto", "pyav", "ffmpeg-vaapi"):
+            raise ValueError(
+                f"{path} 仅支持 auto / pyav / ffmpeg-vaapi，收到 {raw!r}"
             )
         return norm
     return raw  # str

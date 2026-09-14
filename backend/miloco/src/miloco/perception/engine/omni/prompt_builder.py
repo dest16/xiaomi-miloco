@@ -1749,8 +1749,9 @@ def _encode_batch_crops(edge_packets: list[IdentityPacket]) -> list[dict[str, st
 #    任何旋钮能改。LOW 对应多少像素由相机固件/机型决定(在 native libmiot_camera 里,
 #    本仓库看不到);离线对照里实测到 720p,那是**观测值不是代码保证**,别当常量用。
 # ③ 解码:SDK decoder.py 只做 `frame.to_ndarray(format="bgr24")`,不缩放;
-#    perception/collect/ 与 pipeline.py 全程无 resize —— 所以 packet.all_frames 就是
-#    ②的原生尺寸,是全链唯一的"源"。任何消费者都不得原地改它。
+#    camera_adapter 在写入时间窗前按感知引擎的实际 input.fps 抽帧（防高清流把完整
+#    BGR 帧堆满多窗口导致 OOM），但不改空间尺寸。因此 packet.all_frames 仍是②的
+#    原生尺寸,是全链唯一的"源"。任何消费者都不得原地改它。
 # ④ 中途消费者各自缩放,互不影响、也不回写 all_frames:
 #    - 视觉门 gate/visual_gate.py `_preprocess` → 448x448 灰度(只用来算帧差比例)
 #    - 人形检测 tracker/detector.py `preprocess` → 等比缩到 **ONNX 自带的 416x416**

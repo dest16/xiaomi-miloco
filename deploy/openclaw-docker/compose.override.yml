@@ -7,6 +7,8 @@ services:
       context: ${MILOCO_SOURCE_DIR}/deploy/openclaw-docker
       dockerfile: Dockerfile.builder
     user: "${MILOCO_BUILDER_UID:-1000}:${MILOCO_BUILDER_GID:-1000}"
+    environment:
+      MILOCO_BUILD_VERSION: ${MILOCO_BUILD_VERSION:-2026.9.11}
     volumes:
       - ${MILOCO_SOURCE_DIR}:/src:ro
       - ${MILOCO_DIST_DIR}:/out
@@ -17,13 +19,21 @@ services:
         rm -rf /tmp/miloco-build
         mkdir -p /tmp/miloco-build
         cp -a /src/. /tmp/miloco-build/
+        rm -rf /tmp/miloco-build/backend/.venv
         cd /tmp/miloco-build
-        bash scripts/build.sh
+        bash scripts/build.sh --version "$${MILOCO_BUILD_VERSION}"
         find /out -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
         cp -a dist/. /out/
 
   openclaw-gateway:
-    image: ${OPENCLAW_IMAGE}
+    image: miloco-openclaw-runtime:local
+    build:
+      context: ${MILOCO_SOURCE_DIR}/deploy/openclaw-docker
+      dockerfile: Dockerfile.runtime
+      args:
+        OPENCLAW_IMAGE: ${OPENCLAW_IMAGE}
+    devices:
+      - ${MILOCO_VAAPI_DEVICE:-/dev/dri/renderD128}:${MILOCO_VAAPI_DEVICE:-/dev/dri/renderD128}
     environment:
       MILOCO_HOME: /home/node/.openclaw/miloco
       PATH: /home/node/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -33,7 +43,7 @@ services:
       - ${OPENCLAW_LOCAL_DIR}:/home/node/.local
 
   openclaw-cli:
-    image: ${OPENCLAW_IMAGE}
+    image: miloco-openclaw-runtime:local
     environment:
       MILOCO_HOME: /home/node/.openclaw/miloco
       PATH: /home/node/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

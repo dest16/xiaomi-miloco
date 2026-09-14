@@ -15,6 +15,9 @@ if TYPE_CHECKING:
 DecodedVideoCallback = Callable[
     [str, "NDArray[np.uint8]", int, int, int, int], Awaitable[None]
 ]
+EncodedVideoCallback = Callable[
+    [str, bytes, int, int, int, str, bool], Awaitable[None]
+]
 
 
 class CameraVideoStreamSource(Protocol):
@@ -36,6 +39,26 @@ class CameraVideoStreamSource(Protocol):
         registration_id: int,
     ) -> None:
         """Stop a previously registered stream."""
+        ...
+
+
+class CameraEncodedVideoStreamSource(Protocol):
+    """Own an encoded Annex-B packet subscription for browser preview."""
+
+    async def start(
+        self,
+        camera_id: str,
+        channel: int,
+        callback: EncodedVideoCallback,
+    ) -> int:
+        ...
+
+    async def stop(
+        self,
+        camera_id: str,
+        channel: int,
+        registration_id: int,
+    ) -> None:
         ...
 
 

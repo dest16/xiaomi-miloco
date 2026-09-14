@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
 
-from miloco.config.settings import ExternalCameraStreamSettings
+from miloco.config.settings import ExternalCameraStreamSettings, RtspCameraSettings
 from miloco.perception.collect.camera_adapter import (
     CameraDeviceAdapter,
     _CameraDeviceState,
@@ -44,7 +45,8 @@ def _entry(channel: int = 0) -> ExternalCameraStreamSettings:
 async def test_channel_override_never_starts_miot_video(monkeypatch):
     created = []
 
-    def make_source(url: str):
+    def make_source(url: str, **kwargs):
+        del kwargs
         source = _ExternalSource(url)
         created.append(source)
         return source
@@ -75,7 +77,9 @@ async def test_factory_without_overrides_preserves_plain_miot_source(monkeypatch
     proxy.start_camera_decode_video_stream = AsyncMock(return_value=19)
     monkeypatch.setattr(
         "miloco.perception.collect.camera_stream_selector.get_settings",
-        lambda: MagicMock(camera=MagicMock(external_streams=[])),
+        lambda: SimpleNamespace(
+            camera=SimpleNamespace(external_streams=[], rtsp_cameras=[])
+        ),
     )
     source = create_camera_video_stream_source(proxy)
     assert isinstance(source, MiotCameraVideoStreamSource)
@@ -86,6 +90,76 @@ async def test_factory_without_overrides_preserves_plain_miot_source(monkeypatch
     proxy.start_camera_decode_video_stream.assert_awaited_once()
 
 
+async def test_standalone_rtsp_never_calls_miot_video_or_audio(monkeypatch):
+    external = _ExternalSource("rtsp://go2rtc.local/living")
+    rtsp = RtspCameraSettings(
+        id="living-room",
+        name="Living room",
+        room_name="Living room",
+        url="rtsp://go2rtc.local/living",
+    )
+    proxy = MagicMock()
+    proxy.start_camera_decode_video_stream = AsyncMock(return_value=1)
+    proxy.start_camera_decode_audio_stream = AsyncMock(return_value=2)
+    monkeypatch.setattr(
+        "miloco.perception.collect.camera_stream_selector.RtspCameraVideoStreamSource",
+        lambda url, **kwargs: external,
+    )
+    monkeypatch.setattr(
+        "miloco.perception.collect.camera_adapter.get_settings",
+        lambda: SimpleNamespace(
+            camera=SimpleNamespace(rtsp_cameras=[rtsp]),
+            perception=SimpleNamespace(
+                collect=SimpleNamespace(
+                    window_size=4,
+                    max_windows=2,
+                    settle_ms=0,
+                    full_action="drop_oldest",
+                )
+            ),
+        ),
+    )
+    source = ConfiguredCameraVideoStreamSource(proxy, [], [rtsp])
+    adapter = CameraDeviceAdapter(proxy, video_stream_source=source)
+
+    await adapter.connect_device(
+        "living-room",
+        source=PerceptionDevice(
+            did="living-room",
+            name="Living room",
+            device_type="camera",
+            room_name="Living room",
+            online=True,
+        ),
+    )
+
+    assert "living-room" in adapter._devices
+    proxy.start_camera_decode_video_stream.assert_not_awaited()
+    proxy.start_camera_decode_audio_stream.assert_not_awaited()
+
+
+async def test_standalone_rtsp_discovery_does_not_require_miot_login(monkeypatch):
+    rtsp = RtspCameraSettings(
+        id="front-door",
+        name="Front door",
+        room_name="Entrance",
+        url="rtsp://go2rtc.local/front-door",
+    )
+    monkeypatch.setattr(
+        "miloco.perception.collect.camera_adapter.get_settings",
+        lambda: SimpleNamespace(camera=SimpleNamespace(rtsp_cameras=[rtsp])),
+    )
+    adapter = CameraDeviceAdapter(
+        SimpleNamespace(is_authenticated=False),
+        video_stream_source=MagicMock(),
+    )
+
+    discovered = await adapter.discover_devices()
+
+    assert list(discovered) == ["front-door"]
+    assert discovered["front-door"].room_name == "Entrance"
+
+
 async def test_adapter_keeps_miot_audio_with_external_video(monkeypatch):
     external = _ExternalSource("rtsp://camera.local/live")
     proxy = MagicMock()
@@ -94,7 +168,7 @@ async def test_adapter_keeps_miot_audio_with_external_video(monkeypatch):
     proxy.stop_camera_decode_audio_stream = AsyncMock()
     monkeypatch.setattr(
         "miloco.perception.collect.camera_stream_selector.RtspCameraVideoStreamSource",
-        lambda url: external,
+        lambda url, **kwargs: external,
     )
     source = ConfiguredCameraVideoStreamSource(proxy, [_entry()])
     adapter = CameraDeviceAdapter(proxy, video_stream_source=source)
@@ -123,7 +197,7 @@ async def test_unavailable_external_stream_never_falls_back_to_miot(monkeypatch)
     proxy.start_camera_decode_video_stream = AsyncMock(return_value=1)
     monkeypatch.setattr(
         "miloco.perception.collect.camera_stream_selector.RtspCameraVideoStreamSource",
-        lambda url: external,
+        lambda url, **kwargs: external,
     )
     source = ConfiguredCameraVideoStreamSource(proxy, [_entry()])
 

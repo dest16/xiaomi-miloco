@@ -1,9 +1,14 @@
 # OpenClaw runtime with an isolated MiLoCo builder
 
-This deployment keeps the existing official OpenClaw runtime image unchanged.
+This deployment keeps the existing official OpenClaw runtime as the pinned base.
 MiLoCo is built in a separate, disposable builder container. The builder
 writes a complete `dist/` bundle to the host; the runtime sees only that bundle
 and the official installer scripts, both read-only.
+
+A thin local runtime layer installs Debian's FFmpeg, VAAPI userspace library,
+and Mesa driver. This is required because PyAV's bundled FFmpeg does not expose
+VAAPI and the official OpenClaw image has no `ffmpeg` executable. No OpenClaw
+files are replaced.
 
 No second MiLoCo backend container is introduced. The existing OpenClaw state,
 workspace, auth, network, ports, and gateway token continue to come from the
@@ -14,7 +19,8 @@ base Compose file.
 `scripts/build.sh` requires `rsync`, Python, uv, npm, and pnpm. Those are build
 dependencies, not OpenClaw runtime dependencies. The previous derivative image
 installed `rsync` into OpenClaw and then built the fork inside the runtime.
-This override removes that image entirely.
+The builder remains isolated. The runtime layer added here contains only media
+runtime packages; it never runs the MiLoCo source build.
 
 `scripts/install.py --local-dist` performs the same install, model extraction,
 service initialization, account binding, model configuration, and plugin
@@ -42,7 +48,9 @@ OpenClaw plugin package.
 Run from the directory containing the existing official OpenClaw
 `docker-compose.yml`. Replace `/path/to/xiaomi-miloco`, copy the example, then
 set `OPENCLAW_IMAGE` to the exact official image reference already used by the
-deployment. Do not use `latest`.
+deployment. Do not use `latest`. Set `MILOCO_BUILD_VERSION` to the official
+baseline version used by the fork; this avoids ambiguous `0.0` development
+versions when a deployment checkout has no Git tags.
 
 ```bash
 cp /path/to/xiaomi-miloco/deploy/openclaw-docker/.env.example ./miloco.env
@@ -92,8 +100,9 @@ architecture, a `miloco` wheel, a `miloco_cli` wheel,
 dc up -d --force-recreate openclaw-gateway
 ```
 
-The override has no runtime `build:` entry. `openclaw-gateway` and
-`openclaw-cli` both use `${OPENCLAW_IMAGE}` directly.
+The override builds `miloco-openclaw-runtime:local` from `Dockerfile.runtime`;
+both OpenClaw services use that image. The gateway additionally receives only
+the configured `${MILOCO_VAAPI_DEVICE}` render node.
 
 ## Install and initialize from local dist
 
@@ -126,6 +135,17 @@ for external streams, keep the current value. To set it for the first time:
 dc exec openclaw-gateway miloco-cli config set camera.external_streams \
   '[{"physical_did":"<CAMERA_1_DID>","channel":0,"url":"rtsp://10.10.0.1:8554/camera1"}]'
 ```
+
+Enable automatic VAAPI perception decode (with PyAV software fallback):
+
+```bash
+dc exec openclaw-gateway miloco-cli config set camera.rtsp_decode \
+  '{"backend":"auto","ffmpeg_path":"ffmpeg","vaapi_device":"/dev/dri/renderD128"}'
+```
+
+Use the same render node configured as `MILOCO_VAAPI_DEVICE` in `miloco.env`.
+Browser preview of external RTSP cameras is compressed H.264/H.265 passthrough;
+the decoded path is used only by perception and temporary short-MP4 recording.
 
 ## Verify
 

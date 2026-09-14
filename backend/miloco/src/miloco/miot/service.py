@@ -67,6 +67,15 @@ from miloco.miot.schema import (
     DeviceInfo,
     SceneInfo,
 )
+from miloco.perception.collect.camera_stream import (
+    CameraEncodedVideoStreamSource,
+    CameraVideoStreamSource,
+)
+from miloco.perception.collect.camera_stream_selector import (
+    create_camera_encoded_video_stream_source,
+    create_camera_video_stream_source,
+)
+from miloco.utils.agent_config import update_shared_config
 
 logger = logging.getLogger(__name__)
 
@@ -316,9 +325,23 @@ class MiotService:
         self,
         miot_proxy: MiotProxy,
         person_repo: PersonRepo | None = None,
+        video_stream_source: CameraVideoStreamSource | None = None,
+        encoded_video_stream_source: CameraEncodedVideoStreamSource | None = None,
     ):
         self._miot_proxy = miot_proxy
         self._person_repo = person_repo
+        # Web live view owns a separate selector/decoder from perception. RTSP
+        # readers are single-subscriber, so sharing one would steal callbacks.
+        self._video_stream_source = (
+            video_stream_source
+            if video_stream_source is not None
+            else create_camera_video_stream_source(miot_proxy)
+        )
+        self._encoded_video_stream_source = (
+            encoded_video_stream_source
+            if encoded_video_stream_source is not None
+            else create_camera_encoded_video_stream_source()
+        )
         self._lru = LRUStore(miot_proxy._kv_repo.db_connector)
         # 相同通知文案的短窗去重兜底（窗口来自 config.json / settings.yaml
         # notify.dedup_window_sec）。防住 agent 顺序循环里同一条文案被反复重发、
@@ -986,9 +1009,7 @@ class MiotService:
                     camera_id,
                 )
                 return -1
-            return await self._miot_proxy.start_camera_decode_video_stream(
-                camera_id, channel, callback
-            )
+            return await self._video_stream_source.start(camera_id, channel, callback)
         except Exception as e:
             logger.error("Failed to start video stream: %s", e)
             raise MiotServiceException(f"Failed to start video stream: {str(e)}") from e
@@ -1001,12 +1022,41 @@ class MiotService:
                 camera_id,
                 reg_id,
             )
-            await self._miot_proxy.stop_camera_decode_video_stream(
-                camera_id, channel, reg_id
-            )
+            await self._video_stream_source.stop(camera_id, channel, reg_id)
         except Exception as e:
             logger.error("Failed to stop video stream: %s", e)
             raise MiotServiceException(f"Failed to stop video stream: {str(e)}") from e
+
+    def supports_encoded_video_stream(self, camera_id: str, channel: int) -> bool:
+        """Whether this camera can bypass BGR/live transcoding for Web preview."""
+        predicate = getattr(self._encoded_video_stream_source, "supports", None)
+        return bool(predicate and predicate(camera_id, channel))
+
+    async def start_encoded_video_stream(
+        self, camera_id: str, channel: int, callback
+    ) -> int:
+        try:
+            return await self._encoded_video_stream_source.start(
+                camera_id, channel, callback
+            )
+        except Exception as e:
+            logger.error("Failed to start encoded video stream: %s", e)
+            raise MiotServiceException(
+                f"Failed to start encoded video stream: {str(e)}"
+            ) from e
+
+    async def stop_encoded_video_stream(
+        self, camera_id: str, channel: int, reg_id: int
+    ) -> None:
+        try:
+            await self._encoded_video_stream_source.stop(
+                camera_id, channel, reg_id
+            )
+        except Exception as e:
+            logger.error("Failed to stop encoded video stream: %s", e)
+            raise MiotServiceException(
+                f"Failed to stop encoded video stream: {str(e)}"
+            ) from e
 
     async def get_home_info(self, *, refresh: bool = False) -> dict:
         """Get home info。refresh=True 时先刷新云端数据。"""
@@ -1512,6 +1562,7 @@ class MiotService:
             # 各字段按裸 did，与旧行为一致，仅多带 channel。
             base = {
                 "did": did,
+                "source_type": "miot",
                 "name": getattr(info, "name", None),
                 # 透 room_name 让前端能在多摄像头家庭显示"客厅 / 卧室"区分——
                 # 米家默认相机名常是"小米智能摄像机 2 代"等泛称，光看 name 难辨。
@@ -1570,6 +1621,34 @@ class MiotService:
                         ),
                     }
                 )
+        for item in get_settings().camera.rtsp_cameras:
+            out.append(
+                {
+                    "did": item.id,
+                    "source_type": "rtsp",
+                    "name": item.name,
+                    "room_name": item.room_name or None,
+                    "channel_count": 1,
+                    "channel": 0,
+                    # Reachability is owned by the RTSP reader, not MIoT's
+                    # cloud/LAN/NAT gates. connected is the runtime signal.
+                    "cloud_online": True,
+                    "lan_reachable": True,
+                    "is_online": True,
+                    "awake": None,
+                    "stream_error": None,
+                    "voice_in_use": False,
+                    "in_use": item.enabled,
+                    "connected": item.id in connected,
+                    "perception_prompt": prompt_map.get(item.id, ""),
+                    "crop_in_use": item.id not in crop_denied,
+                    "crop_effective": (
+                        item.enabled
+                        and crop_global_on
+                        and item.id not in crop_denied
+                    ),
+                }
+            )
         return out
 
     async def toggle_camera(self, items: list[dict]) -> list[dict]:
@@ -1579,6 +1658,40 @@ class MiotService:
         （``cam:ch1``，前端逐路开关）或裸物理 did；裸 did 对多通道相机 = 该台所有通道一起，
         对单摄 = 它自己。全部校验通过后按 did 整台重算+覆盖写黑名单（D3）。
         """
+        rtsp_by_id = {
+            camera.id: camera for camera in get_settings().camera.rtsp_cameras
+        }
+        rtsp_updates = {
+            str(item["did"]): bool(item["in_use"])
+            for item in items
+            if str(item["did"]) in rtsp_by_id
+        }
+        rtsp_touched = set(rtsp_updates)
+        if rtsp_updates:
+            serialized = []
+            changed = False
+            for camera in rtsp_by_id.values():
+                enabled = rtsp_updates.get(camera.id, camera.enabled)
+                changed = changed or enabled != camera.enabled
+                serialized.append(
+                    {
+                        "id": camera.id,
+                        "name": camera.name,
+                        "room_name": camera.room_name,
+                        "url": camera.url.get_secret_value(),
+                        "enabled": enabled,
+                    }
+                )
+            if changed:
+                update_shared_config(camera={"rtsp_cameras": serialized})
+                await self._sync_camera_adapter()
+            items = [
+                item for item in items if str(item["did"]) not in rtsp_touched
+            ]
+            if not items:
+                all_cameras = await self.list_cameras_with_state()
+                return [cam for cam in all_cameras if cam["did"] in rtsp_touched]
+
         cameras = await self._miot_proxy.get_cameras() or {}
 
         def _cc(pdid: str) -> int:
@@ -1702,7 +1815,8 @@ class MiotService:
             await self._sync_camera_adapter()
         # 返回受影响的相机（按物理 did），结构与 list_cameras_with_state 一致。
         all_cameras = await self.list_cameras_with_state()
-        affected = [cam for cam in all_cameras if cam["did"] in set(updates)]
+        affected_dids = set(updates) | rtsp_touched
+        affected = [cam for cam in all_cameras if cam["did"] in affected_dids]
         return affected
 
     async def toggle_camera_voice(self, items: list[dict]) -> list[dict]:
@@ -1769,6 +1883,13 @@ class MiotService:
         - 裸多通道 did → 展成全部通道（该台各路设同一条须知）；单摄 → 裸 did（cc=1）。
         """
         pdid = physical_camera_did(raw)
+        rtsp_ids = {camera.id for camera in get_settings().camera.rtsp_cameras}
+        if pdid in rtsp_ids:
+            if raw != pdid:
+                raise ValidationException(
+                    f"Standalone RTSP camera has only channel 0: {raw}"
+                )
+            return [pdid]
         if pdid not in cameras:
             raise ValidationException(
                 f"Unknown camera did(s) ['{raw}']; valid: {sorted(cameras.keys())}"

@@ -281,7 +281,8 @@ function CameraSection({
   // 裸 did);拾音是相机级(mic 只在球机/ch0)、按物理 did。
   const feedDidOf = (c: ScopeCamera): string =>
     synthFeedDid(c.did, c.channel, isMulti(c));
-  const hasMic = (c: ScopeCamera): boolean => channelHasMic(c.channel);
+  const hasMic = (c: ScopeCamera): boolean =>
+    c.sourceType === "miot" && channelHasMic(c.channel);
   const activeCount = scopeCameras.filter((c) => c.inUse).length;
   const allOn = total > 0 && activeCount === total;
   const allOff = activeCount === 0;

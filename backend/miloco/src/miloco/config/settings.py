@@ -305,6 +305,63 @@ class ExternalCameraStreamSettings(BaseModel):
         return value
 
 
+class RtspCameraSettings(BaseModel):
+    """A standalone RTSP camera, independent from the MIoT device catalog."""
+
+    id: str = Field(description="Stable camera ID used by perception and Web live view")
+    name: str = Field(description="Human-readable camera name")
+    room_name: str = Field(default="", description="Optional room label")
+    url: SecretStr = Field(description="RTSP/RSTPS URL (kept secret in repr/errors)")
+    enabled: bool = Field(default=True, description="Whether perception should ingest it")
+
+    @field_validator("id", "name")
+    @classmethod
+    def _validate_required_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, value: str) -> str:
+        if ":ch" in value:
+            raise ValueError("id must not contain the reserved ':ch' channel suffix")
+        return value
+
+    @field_validator("room_name")
+    @classmethod
+    def _strip_room_name(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, value: SecretStr) -> SecretStr:
+        return ExternalCameraStreamSettings._validate_url(value)
+
+
+class RtspDecodeSettings(BaseModel):
+    """Decoder used only by the external-RTSP perception path."""
+
+    backend: Literal["auto", "pyav", "ffmpeg-vaapi"] = Field(
+        default="auto",
+        description="Try FFmpeg VAAPI first, or force the PyAV software decoder",
+    )
+    ffmpeg_path: str = Field(default="ffmpeg", description="FFmpeg executable")
+    vaapi_device: str = Field(
+        default="/dev/dri/renderD128",
+        description="DRM render node used by FFmpeg VAAPI",
+    )
+
+    @field_validator("ffmpeg_path", "vaapi_device")
+    @classmethod
+    def _validate_non_empty(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+
 class CameraSettings(BaseModel):
     """摄像头采集参数。"""
 
@@ -313,6 +370,14 @@ class CameraSettings(BaseModel):
     external_streams: list[ExternalCameraStreamSettings] = Field(
         default_factory=list,
         description="按物理 DID + 通道覆盖 MIoT 视频的外部 RTSP 源",
+    )
+    rtsp_cameras: list[RtspCameraSettings] = Field(
+        default_factory=list,
+        description="独立于 MIoT 设备目录的标准 RTSP 摄像头",
+    )
+    rtsp_decode: RtspDecodeSettings = Field(
+        default_factory=RtspDecodeSettings,
+        description="外部 RTSP 感知解码后端（不影响浏览器原码预览）",
     )
 
     @model_validator(mode="after")
@@ -324,6 +389,9 @@ class CameraSettings(BaseModel):
             raise ValueError(
                 "camera.external_streams contains duplicate physical_did/channel"
             )
+        rtsp_ids = [item.id for item in self.rtsp_cameras]
+        if len(rtsp_ids) != len(set(rtsp_ids)):
+            raise ValueError("camera.rtsp_cameras contains duplicate id")
         return self
 
 

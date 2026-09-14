@@ -1199,6 +1199,7 @@ export async function realSwitchScopeHome(homeId: string): Promise<void> {
 //   - PUT in_use=false 时 backend 校验 did 必须存在；in_use=true 任意（清理脏数据）
 interface BackendScopeCamera {
   did: string;
+  source_type?: "miot" | "rtsp";
   name: string | null;
   room_name?: string | null;
   // 三个正交可用性指标。旧后端只有 is_online 时用它兜底 cloud+lan。
@@ -1223,6 +1224,7 @@ export async function realListScopeCameras(): Promise<ScopeCamera[]> {
   );
   return r.data.map((c) => ({
     did: c.did,
+    sourceType: c.source_type ?? "miot",
     name: c.name ?? c.did,
     roomName: c.room_name ?? undefined,
     // 旧后端无三指标时用 is_online 兜底：cloud/lan 都取 is_online、awake 未知。

@@ -45,17 +45,22 @@ class _FakeContainer:
         self.frames = frames or []
         self.decode_error = decode_error
         self.closed = threading.Event()
+        self.decode_released = threading.Event()
         self.close_calls = 0
+        self.decode_thread_id: int | None = None
+        self.close_thread_ids: list[int] = []
 
     def decode(self, stream: object):
         assert stream is self.streams.video[0]
+        self.decode_thread_id = threading.get_ident()
         yield from self.frames
         if self.decode_error is not None:
             raise self.decode_error
-        self.closed.wait(2)
+        self.decode_released.wait(0.05)
 
     def close(self) -> None:
         self.close_calls += 1
+        self.close_thread_ids.append(threading.get_ident())
         self.closed.set()
 
 
@@ -108,11 +113,12 @@ async def test_start_and_stop_own_reader_and_container():
     )
 
     registration_id = await source.start("cam1", 0, _discard_frame)
-    await _wait_until(lambda: bool(opener.calls))
+    await _wait_until(lambda: container.decode_thread_id is not None)
     await source.stop("cam1", 0, registration_id)
 
     assert not source.running
     assert container.closed.is_set()
+    assert container.close_thread_ids == [container.decode_thread_id]
     assert opener.calls[0][1]["options"] == {"rtsp_transport": "tcp"}
     assert opener.calls[0][1]["timeout"] == (5.0, 5.0)
 
@@ -176,6 +182,37 @@ async def test_decode_failure_reconnects_and_frames_resume():
     assert recovered.closed.is_set()
     assert np.array_equal(received[1][0], recovered_frame.pixels)
     assert [item[1] for item in received] == [100, 101]
+
+
+async def test_auto_vaapi_failure_falls_back_to_pyav(monkeypatch, caplog):
+    frame = _FakeFrame(np.ones((1, 2, 3), dtype=np.uint8), 100)
+    opener = _SequenceOpener(_FakeContainer([frame]))
+    source = RtspCameraVideoStreamSource(
+        "rtsp://camera.local/live",
+        decoder_backend="auto",
+        reconnect_backoff_seconds=(10.0,),
+    )
+    source._opener = opener
+
+    def fail_vaapi() -> None:
+        raise FileNotFoundError("ffmpeg")
+
+    monkeypatch.setattr(source, "_read_ffmpeg_vaapi_once", fail_vaapi)
+    received = []
+
+    async def callback(*args) -> None:
+        received.append(args)
+
+    caplog.set_level(logging.WARNING)
+    registration_id = await source.start("cam1", 0, callback)
+    try:
+        await _wait_until(lambda: bool(received))
+    finally:
+        await source.stop("cam1", 0, registration_id)
+
+    assert source._vaapi_disabled is True
+    assert len(opener.calls) == 1
+    assert "falling back to PyAV" in caplog.text
 
 
 async def test_stop_interrupts_reconnect_backoff(caplog):

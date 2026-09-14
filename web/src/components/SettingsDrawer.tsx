@@ -1,12 +1,16 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
+  createRtspCamera,
+  deleteRtspCamera,
   getPerceptionConfig,
   getSchedulerConfig,
+  listRtspCameras,
   updatePerceptionConfig,
   updateSchedulerConfig,
   type MinSuggestionUrgency,
   type PerceptionConfig,
+  type RtspCameraConfig,
 } from "@/api";
 import { useEscClose } from "@/hooks/useEscClose";
 import { toast } from "./Toast";
@@ -58,6 +62,13 @@ export function SettingsDrawer({ open, onClose }: Props) {
   // 内置定时任务自动管理开关（scheduler.enabled）。缺省 true = 自动管理。
   const [schedulerLoaded, setSchedulerLoaded] = useState<boolean | null>(null);
   const [schedulerEnabled, setSchedulerEnabled] = useState(true);
+  const [rtspCameras, setRtspCameras] = useState<RtspCameraConfig[]>([]);
+  const [rtspAvailable, setRtspAvailable] = useState(true);
+  const [rtspBusy, setRtspBusy] = useState(false);
+  const [rtspId, setRtspId] = useState("");
+  const [rtspName, setRtspName] = useState("");
+  const [rtspRoom, setRtspRoom] = useState("");
+  const [rtspUrl, setRtspUrl] = useState("");
 
   useEscClose(open, onClose);
 
@@ -72,6 +83,7 @@ export function SettingsDrawer({ open, onClose }: Props) {
     // 每次重载先把调度值复位为 null：本次读不到就稳定退回 unavailable（disable 开关），
     // 不留用上次会话的旧值，与 e107541 的「读不到就禁用」保持一致。
     setSchedulerLoaded(null);
+    setRtspAvailable(true);
     // 感知参数与调度开关是两个正交接口，用 allSettled 各自独立成败——
     // 任一接口出错（如版本错位）只影响自己那块，不把另一块也拖进错误态。
     Promise.allSettled([
@@ -89,6 +101,7 @@ export function SettingsDrawer({ open, onClose }: Props) {
         setSchedulerLoaded(s.enabled);
         setSchedulerEnabled(s.enabled);
       }),
+      listRtspCameras().then(setRtspCameras),
     ])
       .then((rs) => {
         // 只有感知参数（rs[0]，核心设置）加载失败才报错；调度开关（rs[1]）失败
@@ -98,6 +111,7 @@ export function SettingsDrawer({ open, onClose }: Props) {
         if (rs[0].status === "rejected") {
           toast(t("settings.loadFailed"), "danger");
         }
+        if (rs[2].status === "rejected") setRtspAvailable(false);
       })
       .finally(() => setLoading(false));
   }, [open, t]);
@@ -202,6 +216,52 @@ export function SettingsDrawer({ open, onClose }: Props) {
     // 仅在开关可配置时才回默认 ON；不可用（schedulerLoaded===null，置灰）时保持
     // 当前视觉，避免把置灰的开关拨到 ON 且 schedulerDirty 恒 false 无从写盘。
     if (schedulerAvailable) setSchedulerEnabled(true);
+  }
+
+  async function handleAddRtsp() {
+    if (!rtspId.trim() || !rtspName.trim() || !rtspUrl.trim()) return;
+    setRtspBusy(true);
+    try {
+      await createRtspCamera({
+        id: rtspId.trim(),
+        name: rtspName.trim(),
+        room_name: rtspRoom.trim(),
+        url: rtspUrl.trim(),
+        enabled: true,
+      });
+      setRtspCameras(await listRtspCameras());
+      setRtspId("");
+      setRtspName("");
+      setRtspRoom("");
+      setRtspUrl("");
+      toast(t("settings.rtspAdded"), "ok");
+    } catch (error) {
+      toast(
+        error instanceof Error ? error.message : t("settings.rtspSaveFailed"),
+        "danger",
+      );
+    } finally {
+      setRtspBusy(false);
+    }
+  }
+
+  async function handleDeleteRtsp(camera: RtspCameraConfig) {
+    if (!window.confirm(t("settings.rtspDeleteConfirm", { name: camera.name }))) {
+      return;
+    }
+    setRtspBusy(true);
+    try {
+      await deleteRtspCamera(camera.id);
+      setRtspCameras((items) => items.filter((item) => item.id !== camera.id));
+      toast(t("settings.rtspDeleted"), "ok");
+    } catch (error) {
+      toast(
+        error instanceof Error ? error.message : t("settings.rtspSaveFailed"),
+        "danger",
+      );
+    } finally {
+      setRtspBusy(false);
+    }
   }
 
   const dirty = perceptionDirty || schedulerDirty;
@@ -447,6 +507,96 @@ export function SettingsDrawer({ open, onClose }: Props) {
                     ? t("settings.autoScheduleHint")
                     : t("settings.autoScheduleUnavailable")}
                 </p>
+              </div>
+
+              {/* Standard RTSP cameras: independent from the Xiaomi catalog. */}
+              <div className="space-y-3 pt-5 border-t border-border">
+                <div>
+                  <h3 className="text-body font-medium text-text-primary">
+                    {t("settings.rtspTitle")}
+                  </h3>
+                  <p className="mt-1 text-caption text-text-tertiary">
+                    {rtspAvailable
+                      ? t("settings.rtspHint")
+                      : t("settings.rtspUnavailable")}
+                  </p>
+                </div>
+                {rtspAvailable && (
+                  <>
+                    <div className="space-y-2">
+                      {rtspCameras.map((camera) => (
+                        <div
+                          key={camera.id}
+                          className="rounded-xl border border-border bg-bg-primary p-3"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="text-body text-text-primary truncate">
+                                {camera.name}
+                              </p>
+                              <p className="text-caption text-text-tertiary truncate">
+                                {camera.room_name || camera.id}
+                              </p>
+                              <p className="text-caption text-text-tertiary truncate">
+                                {camera.url}
+                              </p>
+                            </div>
+                            <button
+                              type="button"
+                              disabled={rtspBusy}
+                              onClick={() => handleDeleteRtsp(camera)}
+                              className="shrink-0 text-caption text-danger hover:opacity-70 disabled:opacity-50"
+                            >
+                              {t("settings.rtspDelete")}
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="space-y-2">
+                      <input
+                        value={rtspId}
+                        onChange={(event) => setRtspId(event.target.value)}
+                        placeholder={t("settings.rtspId")}
+                        className="w-full rounded-xl border border-border bg-bg-primary px-3 py-2 text-body text-text-primary"
+                      />
+                      <input
+                        value={rtspName}
+                        onChange={(event) => setRtspName(event.target.value)}
+                        placeholder={t("settings.rtspName")}
+                        className="w-full rounded-xl border border-border bg-bg-primary px-3 py-2 text-body text-text-primary"
+                      />
+                      <input
+                        value={rtspRoom}
+                        onChange={(event) => setRtspRoom(event.target.value)}
+                        placeholder={t("settings.rtspRoom")}
+                        className="w-full rounded-xl border border-border bg-bg-primary px-3 py-2 text-body text-text-primary"
+                      />
+                      <input
+                        value={rtspUrl}
+                        onChange={(event) => setRtspUrl(event.target.value)}
+                        placeholder="rtsp://host:8554/camera"
+                        autoComplete="off"
+                        className="w-full rounded-xl border border-border bg-bg-primary px-3 py-2 text-body text-text-primary"
+                      />
+                      <button
+                        type="button"
+                        disabled={
+                          rtspBusy ||
+                          !rtspId.trim() ||
+                          !rtspName.trim() ||
+                          !rtspUrl.trim()
+                        }
+                        onClick={handleAddRtsp}
+                        className="w-full rounded-xl border border-brand-primary px-3 py-2 text-body text-brand-primary hover:bg-brand-primary/5 disabled:opacity-50"
+                      >
+                        {rtspBusy
+                          ? t("settings.rtspSaving")
+                          : t("settings.rtspAdd")}
+                      </button>
+                    </div>
+                  </>
+                )}
               </div>
 
               {/* 恢复默认 */}

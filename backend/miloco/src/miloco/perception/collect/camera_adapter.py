@@ -127,6 +127,12 @@ class _CameraDeviceState:
     # 订阅完成时刻的 monotonic wall_ms。首帧未到（last_video_frame_ms == 0）时
     # 替代它参与静默判定，给「等首帧」一个上界，见 _FIRST_FRAME_THRESHOLD_MS。
     connected_at_ms: int = 0
+    # Decoded sources may run at 20+ fps and produce multi-megabyte BGR arrays.
+    # Keep only the rate consumed by the perception engine; otherwise the
+    # time-window buffer retains every source frame and its nominally bounded
+    # window count can still consume several GiB for high-resolution RTSP.
+    next_video_sample_ms: int = 0
+    video_sample_interval_ms: int = 0
 
 
 class CameraDeviceAdapter(BaseDeviceAdapter):
@@ -160,14 +166,43 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         require_lan: bool = True,
         cap: bool = True,
     ) -> dict[str, PerceptionDevice]:
-        if not self._miot_proxy.is_authenticated:
-            return {}
-        return self._filter_cameras_from_all(
-            all_devices if all_devices else await self._miot_proxy.get_cameras(),
-            online_only=online_only,
-            require_lan=require_lan,
-            cap=cap,
-        )
+        # Standalone RTSP cameras do not require a Xiaomi account or MIoT LAN
+        # reachability. Give configured sources first claim on the global feed
+        # limit, then fill remaining slots with MIoT cameras.
+        result = self._rtsp_devices()
+        if self._miot_proxy.is_authenticated:
+            result.update(
+                self._filter_cameras_from_all(
+                    all_devices if all_devices else await self._miot_proxy.get_cameras(),
+                    online_only=online_only,
+                    require_lan=require_lan,
+                    cap=cap,
+                )
+            )
+        if cap:
+            from miloco.miot.filter import MAX_ENABLED_CAMERAS
+
+            result = dict(list(result.items())[:MAX_ENABLED_CAMERAS])
+        return result
+
+    @staticmethod
+    def _rtsp_devices() -> dict[str, PerceptionDevice]:
+        return {
+            item.id: PerceptionDevice(
+                did=item.id,
+                name=item.name,
+                device_type="camera",
+                room_id=item.room_name,
+                room_name=item.room_name,
+                online=True,
+            )
+            for item in get_settings().camera.rtsp_cameras
+            if item.enabled
+        }
+
+    @staticmethod
+    def _is_standalone_rtsp(did: str) -> bool:
+        return did in {item.id for item in get_settings().camera.rtsp_cameras}
 
     def _filter_cameras_from_all(
         self,
@@ -496,15 +531,17 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         except Exception as e:
             logger.error("Failed to subscribe decoded video for %s: %s", did, e)
 
-        # Subscribe decoded audio frame stream (multi-reg)
-        try:
-            reg_id = await self._miot_proxy.start_camera_decode_audio_stream(
-                physical_did, channel,
-                self._make_decoded_audio_callback(did, state),
-            )
-            state.decoded_audio_reg_id = reg_id
-        except Exception as e:
-            logger.error("Failed to subscribe decoded audio for %s: %s", did, e)
+        # Standalone RTSP cameras are video-only for now. Crucially, never pass
+        # their local IDs into MIoT audio APIs.
+        if not self._is_standalone_rtsp(physical_did):
+            try:
+                reg_id = await self._miot_proxy.start_camera_decode_audio_stream(
+                    physical_did, channel,
+                    self._make_decoded_audio_callback(did, state),
+                )
+                state.decoded_audio_reg_id = reg_id
+            except Exception as e:
+                logger.error("Failed to subscribe decoded audio for %s: %s", did, e)
 
         # 两路流都没订上 = camera_img_manager 缺失（典型：登录时相机 LAN 未就绪，
         # refresh_cameras 没建成 manager，start_*_stream 返回 -1 静默失败）。保留该
@@ -619,6 +656,23 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
         device identity (so downstream keying stays per-channel).
         """
         physical_did, _ = split_channel_did(did)
+        rtsp = next(
+            (
+                item
+                for item in get_settings().camera.rtsp_cameras
+                if item.id == physical_did
+            ),
+            None,
+        )
+        if rtsp is not None:
+            return PerceptionDevice(
+                did=did,
+                name=rtsp.name,
+                device_type="camera",
+                room_id=rtsp.room_name,
+                room_name=rtsp.room_name,
+                online=True,
+            )
         get_cached_camera = getattr(self._miot_proxy, "get_cached_camera", None)
         camera_info = (
             get_cached_camera(physical_did) if get_cached_camera is not None else None
@@ -754,6 +808,53 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
             decode_ms = 0.0
         return decode_ms
 
+    @staticmethod
+    def _perception_video_fps() -> int:
+        """Return the effective frame rate consumed by the tracker pipeline.
+
+        ``input.fps`` is the base tracker rate. The engine rounds it up to a
+        multiple of ``omni_fps`` (or to ``omni_fps`` itself when that is
+        higher), so collection must mirror that adjustment to avoid silently
+        starving a hot-reloaded engine. Invalid hand-edited values fall back
+        to the production defaults instead of disabling the memory guard.
+        """
+        try:
+            input_cfg = get_settings().perception.engine.get("input", {})
+            base_fps = max(1, int(input_cfg.get("fps", 3)))
+            omni_fps = max(1, int(input_cfg.get("omni_fps", 1)))
+        except (AttributeError, TypeError, ValueError):
+            base_fps, omni_fps = 3, 1
+
+        if omni_fps >= base_fps:
+            return omni_fps
+        return omni_fps * -(-base_fps // omni_fps)
+
+    @classmethod
+    def _should_buffer_video_frame(
+        cls, state: _CameraDeviceState, wall_ms: int
+    ) -> bool:
+        """Rate-limit decoded BGR frames before they enter window storage.
+
+        The monotonic deadline preserves the long-term target rate without
+        bursts after a stalled source. Recompute when runtime configuration
+        changes so ``omni_fps`` hot reloads remain effective.
+        """
+        interval_ms = max(1, round(1000 / cls._perception_video_fps()))
+        if state.video_sample_interval_ms != interval_ms:
+            state.video_sample_interval_ms = interval_ms
+            state.next_video_sample_ms = wall_ms
+
+        if wall_ms < state.next_video_sample_ms:
+            return False
+
+        state.next_video_sample_ms += interval_ms
+        if state.next_video_sample_ms <= wall_ms:
+            # A long source gap must not create a catch-up burst. Advance to
+            # the first deadline strictly after this frame.
+            missed = (wall_ms - state.next_video_sample_ms) // interval_ms + 1
+            state.next_video_sample_ms += missed * interval_ms
+        return True
+
     def _make_decoded_video_callback(self, did: str, state: _CameraDeviceState):
         """Decoded video frame callback: feeds decoded_video track in sync buffer.
 
@@ -782,6 +883,14 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                     h.skip_rolling()
                     return
                 wall_ms, unix_ms = self._calibrate(state, ts)
+                # Every decoded frame counts as liveness, but only the rate the
+                # tracker consumes is retained. This bounds BGR storage before
+                # the multi-window buffer, where dropping is too late to
+                # protect high-resolution RTSP sources from OOM.
+                state.last_video_frame_ms = wall_ms
+                if not self._should_buffer_video_frame(state, wall_ms):
+                    h.skip_rolling()
+                    return
                 decode_latency_ms = self._compute_decode_latency(
                     recv_unix_ms, decoded_unix_ms
                 )
@@ -794,7 +903,6 @@ class CameraDeviceAdapter(BaseDeviceAdapter):
                     decoded_unix_ms=decoded_unix_ms,
                     decode_latency_ms=decode_latency_ms,
                 )
-                state.last_video_frame_ms = wall_ms
                 state.sync_buffer.put(
                     "decoded_video", decoded, stream_ts=ts, wall_ms=wall_ms
                 )

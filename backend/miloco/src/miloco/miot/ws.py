@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import struct
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
@@ -261,6 +262,7 @@ class MIoTVideoStreamManager:
     # Active per-camera resources (only present while subscribers exist).
     _camera_encoder: dict[str, H264LiveEncoder]
     _camera_reg_id: dict[str, int]      # SDK register_decode_video reg_id
+    _camera_encoded_reg_id: dict[str, int]  # external RTSP Annex-B subscription
     # Click-triggered NAL clip recorders. Counted as subscribers alongside WS
     # clients for the SDK start/stop lifecycle — adding the first recorder
     # while no WS is connected triggers ``start_video_stream``; removing the
@@ -284,6 +286,7 @@ class MIoTVideoStreamManager:
         self._camera_seen_keyframe = set()
         self._camera_encoder = {}
         self._camera_reg_id = {}
+        self._camera_encoded_reg_id = {}
         self._camera_recorders = {}
         self._camera_locks = {}
         logger.info("Init MIoT Video WS Manager (transcode mode, gop=%d)",
@@ -294,6 +297,19 @@ class MIoTVideoStreamManager:
         has_ws = bool(self._camera_connect_map.get(camera_tag))
         has_rec = bool(self._camera_recorders.get(camera_tag))
         return has_ws or has_rec
+
+    def _has_websockets(self, camera_tag: str) -> bool:
+        return bool(self._camera_connect_map.get(camera_tag))
+
+    def _uses_passthrough(self, camera_id: str, channel: int) -> bool:
+        try:
+            service = manager.miot_service
+        except AttributeError:
+            # Unit tests and early process initialization may construct this
+            # manager before the global MIoT service is attached.
+            return False
+        predicate = getattr(service, "supports_encoded_video_stream", None)
+        return bool(predicate and predicate(camera_id, channel))
 
     def has_emitted_frame(self, camera_id: str, channel: int) -> bool:
         """True once at least one keyframe has been broadcast for this camera.
@@ -310,7 +326,12 @@ class MIoTVideoStreamManager:
         return f"{camera_id}.{channel}" in self._camera_seen_keyframe
 
     async def _ensure_sdk_subscription(
-        self, camera_id: str, channel: int, camera_tag: str
+        self,
+        camera_id: str,
+        channel: int,
+        camera_tag: str,
+        *,
+        for_transcode: bool = True,
     ) -> None:
         """Idempotent: start SDK stream + allocate per-camera encoder.
 
@@ -318,8 +339,15 @@ class MIoTVideoStreamManager:
         on the first subscriber of any kind. Holding ``_lock_for(camera_tag)``
         is the caller's responsibility — this method does not re-acquire it.
         """
-        self._camera_seen_keyframe.discard(camera_tag)
-        self._camera_codec.pop(camera_tag, None)
+        if camera_tag in self._camera_reg_id and self._camera_reg_id[camera_tag] >= 0:
+            if for_transcode and camera_tag not in self._camera_encoder:
+                self._camera_encoder[camera_tag] = H264LiveEncoder(
+                    gop=self._TRANSCODE_GOP
+                )
+            return
+        if for_transcode:
+            self._camera_seen_keyframe.discard(camera_tag)
+            self._camera_codec.pop(camera_tag, None)
         self._camera_connect_map.setdefault(camera_tag, {})
         try:
             reg_id = await manager.miot_service.start_video_stream(
@@ -328,20 +356,49 @@ class MIoTVideoStreamManager:
                 callback=self.__video_stream_callback,
             )
         except Exception:
-            self._camera_connect_map.pop(camera_tag, None)
+            if not self._has_websockets(camera_tag):
+                self._camera_connect_map.pop(camera_tag, None)
             raise
         if reg_id < 0:
-            self._camera_connect_map.pop(camera_tag, None)
+            if not self._has_websockets(camera_tag):
+                self._camera_connect_map.pop(camera_tag, None)
             raise RuntimeError(
                 f"Camera {camera_id} not registered with SDK "
                 "(likely PPCS not handshaken). "
                 "Try `miloco-cli account unbind && account bind`."
             )
         self._camera_reg_id[camera_tag] = reg_id
-        self._camera_encoder[camera_tag] = H264LiveEncoder(gop=self._TRANSCODE_GOP)
+        if for_transcode:
+            self._camera_encoder[camera_tag] = H264LiveEncoder(
+                gop=self._TRANSCODE_GOP
+            )
         logger.info(
-            "Start video stream (transcode), %s.%d reg_id=%d",
-            camera_id, channel, reg_id,
+            "Start decoded video stream (%s), %s.%d reg_id=%d",
+            "transcode" if for_transcode else "record-only",
+            camera_id,
+            channel,
+            reg_id,
+        )
+
+    async def _ensure_encoded_subscription(
+        self, camera_id: str, channel: int, camera_tag: str
+    ) -> None:
+        if self._camera_encoded_reg_id.get(camera_tag, -1) >= 0:
+            return
+        self._camera_seen_keyframe.discard(camera_tag)
+        self._camera_codec.pop(camera_tag, None)
+        self._camera_connect_map.setdefault(camera_tag, {})
+        reg_id = await manager.miot_service.start_encoded_video_stream(
+            camera_id, channel, self.__encoded_video_stream_callback
+        )
+        if reg_id < 0:
+            raise RuntimeError(f"Camera {camera_id} has no encoded RTSP preview source")
+        self._camera_encoded_reg_id[camera_tag] = reg_id
+        logger.info(
+            "Start video stream (RTSP passthrough), %s.%d reg_id=%d",
+            camera_id,
+            channel,
+            reg_id,
         )
 
     async def resubscribe_camera(self, camera_id: str) -> None:
@@ -391,6 +448,10 @@ class MIoTVideoStreamManager:
                 channel = int(channel_str)
             except ValueError:  # pragma: no cover - camera_tag 恒为 did.channel
                 continue
+            if self._uses_passthrough(did, channel):
+                # External RTSP readers own their reconnect lifecycle and are
+                # unrelated to the MIoT native instance being rebuilt.
+                continue
             async with self._lock_for(camera_tag):
                 # 取锁期间订阅方可能已全部离开（_teardown_if_idle 清了 reg_id），
                 # 那就不该在新实例上白开一路流、白占相机的并发流名额。
@@ -424,27 +485,42 @@ class MIoTVideoStreamManager:
     async def _teardown_if_idle(
         self, camera_id: str, channel: int, camera_tag: str
     ) -> None:
-        """If no subscribers remain, stop SDK stream and free encoder.
+        """Reconcile raw-preview and decoded/recording subscriptions.
 
         Caller must hold ``_lock_for(camera_tag)``.
         """
-        if self._has_subscribers(camera_tag):
-            return
-        reg_id = self._camera_reg_id.pop(camera_tag, -1)
-        if reg_id >= 0:
-            await manager.miot_service.stop_video_stream(
-                camera_id, channel, reg_id
-            )
-        encoder = self._camera_encoder.pop(camera_tag, None)
-        if encoder is not None:
-            await encoder.close()
-        self._camera_connect_map.pop(camera_tag, None)
-        self._camera_codec.pop(camera_tag, None)
-        self._camera_seen_keyframe.discard(camera_tag)
-        logger.info(
-            "No connection, stop video stream, %s.%d",
-            camera_id, channel,
-        )
+        has_ws = self._has_websockets(camera_tag)
+        has_recorder = bool(self._camera_recorders.get(camera_tag))
+        passthrough = self._uses_passthrough(camera_id, channel)
+
+        if not has_ws:
+            encoded_reg_id = self._camera_encoded_reg_id.pop(camera_tag, -1)
+            if encoded_reg_id >= 0:
+                await manager.miot_service.stop_encoded_video_stream(
+                    camera_id, channel, encoded_reg_id
+                )
+            self._camera_codec.pop(camera_tag, None)
+            self._camera_seen_keyframe.discard(camera_tag)
+
+        decoded_needed = has_recorder or (has_ws and not passthrough)
+        if not decoded_needed:
+            reg_id = self._camera_reg_id.pop(camera_tag, -1)
+            if reg_id >= 0:
+                await manager.miot_service.stop_video_stream(
+                    camera_id, channel, reg_id
+                )
+
+        encoder_needed = has_ws and not passthrough
+        if not encoder_needed:
+            encoder = self._camera_encoder.pop(camera_tag, None)
+            if encoder is not None:
+                await encoder.close()
+
+        if not has_ws and not has_recorder:
+            self._camera_connect_map.pop(camera_tag, None)
+            self._camera_reg_id.pop(camera_tag, None)
+            self._camera_encoded_reg_id.pop(camera_tag, None)
+            logger.info("No connection, stop video stream, %s.%d", camera_id, channel)
 
     def _lock_for(self, camera_tag: str) -> asyncio.Lock:
         """Get-or-create the asyncio.Lock for this camera_tag.
@@ -483,9 +559,16 @@ class MIoTVideoStreamManager:
             # check both WS and recorder maps so a recorder already attached
             # before any browser tab opens doesn't cause us to start a
             # second SDK callback.
-            sdk_just_started = not self._has_subscribers(camera_tag)
-            if sdk_just_started:
-                await self._ensure_sdk_subscription(camera_id, channel, camera_tag)
+            preview_just_started = not self._has_websockets(camera_tag)
+            if preview_just_started:
+                if self._uses_passthrough(camera_id, channel):
+                    await self._ensure_encoded_subscription(
+                        camera_id, channel, camera_tag
+                    )
+                else:
+                    await self._ensure_sdk_subscription(
+                        camera_id, channel, camera_tag, for_transcode=True
+                    )
             user_tag = f"{user_name}.{token_hash}"
             self._camera_connect_map[camera_tag].setdefault(user_tag, OrderedDict())
             connection_id = str(self._camera_connect_id)
@@ -522,7 +605,7 @@ class MIoTVideoStreamManager:
             # first-frame event (which never fires again until the
             # camera_tag fully tears down).
             cached_codec = self._camera_codec.get(camera_tag)
-            if cached_codec is not None and not sdk_just_started:
+            if cached_codec is not None:
                 try:
                     await websocket.send_text(self._build_init_msg(cached_codec))
                 except Exception as err:
@@ -584,8 +667,16 @@ class MIoTVideoStreamManager:
         """
         camera_tag = f"{camera_id}.{channel}"
         async with self._lock_for(camera_tag):
-            if not self._has_subscribers(camera_tag):
-                await self._ensure_sdk_subscription(camera_id, channel, camera_tag)
+            if not self._camera_recorders.get(camera_tag):
+                await self._ensure_sdk_subscription(
+                    camera_id,
+                    channel,
+                    camera_tag,
+                    for_transcode=(
+                        self._has_websockets(camera_tag)
+                        and not self._uses_passthrough(camera_id, channel)
+                    ),
+                )
             self._camera_recorders.setdefault(camera_tag, []).append(recorder)
             logger.info(
                 "Recorder attached, %s, active_count=%d",
@@ -676,6 +767,12 @@ class MIoTVideoStreamManager:
             except Exception as e:
                 logger.error("recorder feed_bgr error %s: %s", camera_tag, e)
 
+        # External RTSP Web viewers receive the compressed source through
+        # __encoded_video_stream_callback. This decoded subscription exists
+        # only while a short-MP4 recorder is attached.
+        if self._uses_passthrough(did, channel):
+            return
+
         # Announce the h264 init handshake once per camera_tag, BEFORE the
         # encode path and independent of it. Keeping _camera_codec populated
         # even during a recorder-only window means a WS client joining later
@@ -740,6 +837,44 @@ class MIoTVideoStreamManager:
                 wire_ts & 0xFFFFFFFFFFFFFFFF,
             )
             await self._broadcast(camera_tag, payload=header + nal_bytes)
+
+    async def __encoded_video_stream_callback(
+        self,
+        did: str,
+        data: bytes,
+        ts: int,
+        sequence: int,
+        channel: int,
+        codec: str,
+        is_keyframe: bool,
+    ) -> None:
+        """Forward an external RTSP H.264/H.265 access unit without decoding."""
+        del sequence
+        camera_tag = f"{did}.{channel}"
+        if not self._has_websockets(camera_tag):
+            return
+        codec_id = (
+            MIoTCameraCodec.VIDEO_H265
+            if codec == "h265"
+            else MIoTCameraCodec.VIDEO_H264
+        )
+        if self._camera_codec.get(camera_tag) != codec_id:
+            self._camera_codec[camera_tag] = codec_id
+            await self._broadcast(camera_tag, text=self._build_init_msg(codec_id))
+
+        if camera_tag not in self._camera_seen_keyframe:
+            if not is_keyframe:
+                return
+            self._camera_seen_keyframe.add(camera_tag)
+
+        _TS_SAFE_MAX = 9_000_000_000_000_000
+        wire_ts = ts if 0 <= ts < _TS_SAFE_MAX else int(time.time() * 1000)
+        header = struct.pack(
+            ">B7xQ",
+            1 if is_keyframe else 0,
+            wire_ts & 0xFFFFFFFFFFFFFFFF,
+        )
+        await self._broadcast(camera_tag, payload=header + data)
 
 
 miot_video_stream_manager = MIoTVideoStreamManager()

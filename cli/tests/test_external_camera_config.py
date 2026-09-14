@@ -51,6 +51,25 @@ def test_cli_config_persists_external_stream_array(isolated_config):
     assert load_config()["camera"]["external_streams"][0]["url"] == URL
 
 
+def test_cli_config_persists_rtsp_decode_settings(isolated_config):
+    assert set_value("camera.rtsp_decode.backend", "FFMPEG-VAAPI") == "ffmpeg-vaapi"
+    assert set_value("camera.rtsp_decode.ffmpeg_path", "/usr/bin/ffmpeg") == "/usr/bin/ffmpeg"
+    assert set_value("camera.rtsp_decode.vaapi_device", "/dev/dri/renderD129") == "/dev/dri/renderD129"
+
+    decode = load_config()["camera"]["rtsp_decode"]
+    assert decode == {
+        "backend": "ffmpeg-vaapi",
+        "ffmpeg_path": "/usr/bin/ffmpeg",
+        "vaapi_device": "/dev/dri/renderD129",
+    }
+
+
+@pytest.mark.parametrize("value", ["", "vaapi", "ffmpeg", "gpu"])
+def test_cli_config_rejects_invalid_rtsp_decode_backend(value):
+    with pytest.raises(ValueError, match="auto / pyav / ffmpeg-vaapi"):
+        set_value("camera.rtsp_decode.backend", value)
+
+
 @pytest.mark.parametrize(
     "value",
     [

@@ -274,6 +274,8 @@ export interface PerceptionCamera {
 export interface ScopeCamera {
   did: string;
   name: string;
+  // Video source ownership. RTSP cameras bypass Xiaomi cloud/LAN/NAT gates.
+  sourceType: "miot" | "rtsp";
   // 通道号（多通道相机各条通道 0 / 1 / ...）；单通道相机恒为 0。用于播放取流、复合键去重。
   channel: number;
   // 该相机的通道总数（后端 channel_count）。判「多通道相机」的权威信号：channelCount>1 才

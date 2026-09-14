@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import CancelledError, Future, TimeoutError
 from typing import Any
@@ -63,6 +65,10 @@ class RtspCameraVideoStreamSource:
         open_timeout_seconds: float = _DEFAULT_OPEN_TIMEOUT_SECONDS,
         read_timeout_seconds: float = _DEFAULT_READ_TIMEOUT_SECONDS,
         opener: Callable[..., Any] | None = None,
+        decoder_backend: str = "pyav",
+        ffmpeg_path: str = "ffmpeg",
+        vaapi_device: str = "/dev/dri/renderD128",
+        output_fps: int = 3,
     ) -> None:
         parsed = urlsplit(url)
         if parsed.scheme not in {"rtsp", "rtsps"} or not parsed.hostname:
@@ -77,12 +83,24 @@ class RtspCameraVideoStreamSource:
         self._reconnect_backoff_seconds = tuple(reconnect_backoff_seconds)
         self._open_timeout = open_timeout_seconds
         self._read_timeout = read_timeout_seconds
+        if decoder_backend not in {"auto", "pyav", "ffmpeg-vaapi"}:
+            raise ValueError("Unsupported RTSP decoder backend")
+        if output_fps <= 0:
+            raise ValueError("output_fps must be positive")
         self._opener = opener or av.open
+        # An injected opener is a PyAV test seam and must never spawn FFmpeg.
+        self._decoder_backend = "pyav" if opener is not None else decoder_backend
+        self._ffmpeg_path = ffmpeg_path
+        self._vaapi_device = vaapi_device
+        self._output_fps = output_fps
+        self._vaapi_disabled = False
+        self._vaapi_ever_emitted = False
 
         self._state_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._container: Any | None = None
+        self._process: subprocess.Popen[bytes] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._callback: DecodedVideoCallback | None = None
         self._camera_id: str | None = None
@@ -153,10 +171,15 @@ class RtspCameraVideoStreamSource:
                 return
             self._stop_event.set()
             thread = self._thread
-            container = self._container
+            process = self._process
 
-        if container is not None:
-            await asyncio.to_thread(self._close_container, container)
+        if process is not None and process.poll() is None:
+            process.terminate()
+
+        # PyAV/FFmpeg containers are not safe to close from a thread other than
+        # the one currently executing decode(). Doing so can race native
+        # demux/decoder state and terminate the whole process. The read timeout
+        # bounds this wait; _reader_main closes the container in its own thread.
         if thread is not threading.current_thread():
             await asyncio.to_thread(thread.join)
 
@@ -164,6 +187,7 @@ class RtspCameraVideoStreamSource:
             pending = tuple(self._pending_callbacks)
             self._thread = None
             self._container = None
+            self._process = None
             self._loop = None
             self._callback = None
             self._camera_id = None
@@ -184,6 +208,12 @@ class RtspCameraVideoStreamSource:
         while not self._stop_event.is_set():
             container: Any | None = None
             try:
+                if self._decoder_backend != "pyav" and not self._vaapi_disabled:
+                    self._read_ffmpeg_vaapi_once()
+                    connected_once = connected_once or self._vaapi_ever_emitted
+                    if not self._stop_event.is_set():
+                        logger.warning("RTSP stream ended for %s", self._safe_url)
+                    continue
                 container = self._opener(
                     self._url,
                     mode="r",
@@ -208,6 +238,19 @@ class RtspCameraVideoStreamSource:
             except Exception as exc:  # noqa: BLE001
                 if self._stop_event.is_set():
                     break
+                if (
+                    self._decoder_backend == "auto"
+                    and not self._vaapi_ever_emitted
+                    and not self._vaapi_disabled
+                ):
+                    self._vaapi_disabled = True
+                    logger.warning(
+                        "FFmpeg VAAPI unavailable for %s (%s); falling back to PyAV",
+                        self._safe_url,
+                        type(exc).__name__,
+                    )
+                    backoff_index = 0
+                    continue
                 if connected_once:
                     logger.warning(
                         "RTSP stream disconnected for %s (%s)",
@@ -244,6 +287,107 @@ class RtspCameraVideoStreamSource:
             backoff_index += 1
             if self._stop_event.wait(delay):
                 break
+
+    def _read_ffmpeg_vaapi_once(self) -> None:
+        """Decode in FFmpeg/VAAPI, sample on-GPU, and pipe BGR rawvideo in NUT."""
+        command = [
+            self._ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-rtsp_transport",
+            "tcp",
+            "-hwaccel",
+            "vaapi",
+            "-hwaccel_device",
+            self._vaapi_device,
+            "-hwaccel_output_format",
+            "vaapi",
+            "-i",
+            self._url,
+            "-map",
+            "0:v:0",
+            "-an",
+            "-vf",
+            f"fps={self._output_fps},hwdownload,format=nv12,format=bgr24",
+            "-c:v",
+            "rawvideo",
+            "-threads:v",
+            "1",
+            "-pix_fmt",
+            "bgr24",
+            "-f",
+            "nut",
+            "-flush_packets",
+            "1",
+            "pipe:1",
+        ]
+        process = subprocess.Popen(  # noqa: S603 - argv is never passed through a shell
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        with self._state_lock:
+            self._process = process
+        assert process.stdout is not None
+        assert process.stderr is not None
+        stderr_tail: deque[str] = deque(maxlen=8)
+
+        def drain_stderr() -> None:
+            for raw_line in iter(process.stderr.readline, b""):
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if line:
+                    stderr_tail.append(line.replace(self._url, self._safe_url))
+
+        stderr_thread = threading.Thread(
+            target=drain_stderr,
+            name=f"rtsp-vaapi-stderr-{self._camera_id}",
+            daemon=True,
+        )
+        stderr_thread.start()
+        container: Any | None = None
+        emitted = False
+        try:
+            container = av.open(process.stdout, mode="r", format="nut")
+            with self._state_lock:
+                self._container = container
+            video_stream = container.streams.video[0]
+            logger.info(
+                "RTSP perception decoder=ffmpeg-vaapi device=%s fps=%d source=%s",
+                self._vaapi_device,
+                self._output_fps,
+                self._safe_url,
+            )
+            for frame in container.decode(video_stream):
+                if self._stop_event.is_set():
+                    break
+                emitted = True
+                self._vaapi_ever_emitted = True
+                self._deliver_frame(frame)
+            if not self._stop_event.is_set() and process.wait(timeout=1) != 0:
+                detail = "; ".join(stderr_tail) or "ffmpeg exited without diagnostics"
+                raise RuntimeError(detail)
+        finally:
+            if container is not None:
+                with self._state_lock:
+                    if self._container is container:
+                        self._container = None
+                self._close_container(container)
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+            with self._state_lock:
+                if self._process is process:
+                    self._process = None
+            if not emitted and process.returncode not in {None, 0}:
+                detail = "; ".join(stderr_tail) or "ffmpeg exited before first frame"
+                raise RuntimeError(detail)
 
     def _deliver_frame(self, frame: Any) -> None:
         recv_unix_ms = time.time_ns() // 1_000_000

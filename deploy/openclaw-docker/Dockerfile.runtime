@@ -1,0 +1,17 @@
+ARG OPENCLAW_IMAGE
+FROM ${OPENCLAW_IMAGE}
+
+USER root
+
+# MiLoCo's external-RTSP perception backend launches the distribution FFmpeg
+# so VAAPI and Mesa's AMD driver are available independently of PyAV's bundled
+# FFmpeg build. vainfo is retained as a small, useful deployment diagnostic.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libva2 \
+        mesa-va-drivers \
+        vainfo \
+    && rm -rf /var/lib/apt/lists/*
+
+USER node
